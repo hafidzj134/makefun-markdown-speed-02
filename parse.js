@@ -223,17 +223,29 @@ function stripQuoteMarker(line, baseCol) {
   while (i < line.length && cols < 3 && line[i] === ' ') { i++; cols++; }
   if (line[i] !== '>') return null;
   i++; cols++;
+  let partial = '';
   if (line[i] === '\t') {
     // The tab itself is the marker's one optional whitespace: only its
     // first column is consumed, the rest stays as content spaces.
     const w = 4 - ((baseCol + cols) % 4);
-    return { text: ' '.repeat(w - 1) + line.slice(i + 1), cols: cols + 1 };
+    partial = ' '.repeat(w - 1);
+    cols += w;
+    i++;
+  } else if (line[i] === ' ') { i++; cols++; }
+  // Materialise the rest of the content's leading whitespace run as
+  // spaces, so any tab keeps the width it had at its original column.
+  let text = partial;
+  let c = cols;
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
+    if (line[i] === ' ') { text += ' '; c++; i++; }
+    else {
+      const add = 4 - ((baseCol + c) % 4);
+      text += ' '.repeat(add);
+      c += add;
+      i++;
+    }
   }
-  if (line[i] === ' ') { i++; cols++; }
-  if (line[i] === '\t') {
-    return { text: ' '.repeat(4 - ((baseCol + cols) % 4)) + line.slice(i + 1), cols };
-  }
-  return { text: line.slice(i), cols };
+  return { text: text + line.slice(i), cols };
 }
 const RE_DEF_START = /^ {0,3}\[/;
 
@@ -516,25 +528,44 @@ function stripIndent(line, indent, expandTab, baseCol) {
   baseCol = baseCol || 0;
   let cols = 0;
   let i = 0;
+  let partial = '';
   while (i < line.length && cols < indent) {
     const ch = line[i];
     if (ch === ' ') { cols++; i++; }
     else if (ch === '\t') {
       const add = 4 - ((baseCol + cols) % 4);
       if (cols + add <= indent) { cols += add; i++; }
-      else return ' '.repeat(cols + add - indent) + line.slice(i + 1);
+      else {
+        // The tab straddles the strip boundary: its remaining width
+        // stays behind as spaces.
+        partial = ' '.repeat(cols + add - indent);
+        cols += add;
+        i++;
+        break;
+      }
     } else break;
   }
   if (cols < indent) {
     return RE_BLANK.test(line) ? '' : null;
   }
-  // Container stripping (list items) only: a tab that starts exactly at
-  // the strip boundary keeps the width it had at its original column,
-  // as spaces.
-  if (expandTab && indent > 0 && line[i] === '\t') {
-    return ' '.repeat(4 - ((baseCol + cols) % 4)) + line.slice(i + 1);
+  if (expandTab) {
+    // Container stripping (list items): materialise the rest of the
+    // leading whitespace run as spaces, so any tab keeps the width it
+    // had at its original column.
+    let out = partial;
+    let c = cols;
+    while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
+      if (line[i] === ' ') { out += ' '; c++; i++; }
+      else {
+        const add = 4 - ((baseCol + c) % 4);
+        out += ' '.repeat(add);
+        c += add;
+        i++;
+      }
+    }
+    return out + line.slice(i);
   }
-  return line.slice(i);
+  return partial + line.slice(i);
 }
 
 // Split a table row into cells on every unescaped pipe (code spans do
@@ -762,7 +793,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         }
         break;
       }
-      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false, baseCol + quoteCols, undefined, lazyIdx) });
+      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false, 0, undefined, lazyIdx) });
       continue;
     }
 
@@ -813,13 +844,19 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
     i++;
     let setext = 0;
     while (i < n) {
-      const l = lines[i];
+      let l = lines[i];
       if (RE_BLANK.test(l)) {
         // A whitespace-only final line still belongs to the paragraph.
         if (i === n - 1 && chunk.length && l.length > 0) { chunk.push(l); i++; }
         break;
       }
       if (lazySet && lazySet.has(i)) { chunk.push(l); i++; continue; }
+      // Inside a list item, a paragraph continuation line that is still
+      // indented by four or more columns after the item dedent has
+      // those four columns folded away.
+      if (inItem && measureIndent(l, 0, 4, baseCol).cols >= 4) {
+        l = stripIndent(l, 4, false, baseCol) ?? l;
+      }
       const sm = RE_SETEXT.exec(l);
       if (sm && chunk.length >= 1) { setext = sm[1][0] === '=' ? 1 : 2; i++; break; }
       // Table: second line is a delimiter row.
@@ -830,11 +867,18 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           if (header.length === align.length) {
             i++;
             const rows = [];
-            while (i < n && !RE_BLANK.test(lines[i])) {
-              // A body row ends at a line that starts another block.
+            while (i < n) {
               const rl = lines[i];
+              if (RE_BLANK.test(rl)) {
+                // A line of spaces and exactly one tab still counts as
+                // a (empty) row; any other blank line ends the table.
+                if (/^ *\t$/.test(rl)) { rows.push(splitRow(rl)); i++; continue; }
+                break;
+              }
+              // A body row ends at a line that starts another block.
               if (RE_QUOTE.test(rl) || RE_FENCE.test(rl) || RE_ATX.test(rl) ||
-                  RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl)) break;
+                  RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl) ||
+                  measureIndent(rl, 0, 4, baseCol).cols >= 4) break;
               rows.push(splitRow(rl));
               i++;
             }
@@ -1001,7 +1045,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
     const meter = {};
-      items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent, meter, itemLazy));
+      items.push(lexBlocks(itemLines, state, true, 0, meter, itemLazy));
       if (meter.blankBetween) loose = true;
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
@@ -1195,7 +1239,7 @@ function matchExtendedAutolink(s, i) {
     return null;
   }
   let protocol = null;
-  if (head.startsWith('www.')) protocol = 'www';
+  if (s.startsWith('www.', i)) protocol = 'www';
   else if (head.startsWith('http://')) protocol = 'http';
   else if (head.startsWith('https://')) protocol = 'https';
   else if (head.startsWith('ftp://')) protocol = 'ftp';
@@ -1254,7 +1298,7 @@ function trimAutolink(text) {
 // Links may not contain links: `tracker`, when given, records whether a
 // link was formed, so a caller parsing candidate link text can reject the
 // outer link when an inner one won.
-function parseInline(s, defs, tracker) {
+function parseInline(s, defs, tracker, inLink) {
   const nodes = [];
   let text = '';
   const flushText = () => {
@@ -1392,7 +1436,7 @@ function parseInline(s, defs, tracker) {
             continue;
           }
           const innerTracker = { link: false };
-          const inner = parseInline(linkText, defs, innerTracker);
+          const inner = parseInline(linkText, defs, innerTracker, true);
           if (!innerTracker.link) {
             flushText();
             let tag = '<a href="' + escapeAttr(cleanHref(href)) + '"';
@@ -1417,7 +1461,8 @@ function parseInline(s, defs, tracker) {
     }
     // Extended autolinks starting inside running text.
     const chLow = (ch >= 'A' && ch <= 'Z') ? ch.toLowerCase() : ch;
-    if ((chLow === 'w' || chLow === 'h' || chLow === 'f' || chLow === 'm' || chLow === 'x') &&
+    if (!inLink &&
+        (chLow === 'w' || chLow === 'h' || chLow === 'f' || chLow === 'm' || chLow === 'x') &&
         (i === 0 || !/[A-Za-z0-9]/.test(s[i - 1]))) {
       const auto = matchExtendedAutolink(s, i);
       if (auto) {
@@ -1427,7 +1472,8 @@ function parseInline(s, defs, tracker) {
         continue;
       }
     }
-    if ((ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') &&
+    if (!inLink &&
+        (ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') &&
         (i === 0 || !/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i - 1]))) {
       const addr = matchEmailCore(s, i);
       if (addr) {
