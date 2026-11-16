@@ -1354,6 +1354,13 @@ function matchExtendedAutolink(s, i) {
 
 function trimAutolink(text) {
   let t = text;
+  // An opening parenthesis with no closing parenthesis anywhere after
+  // it ends the link just before that parenthesis.
+  const lastClose = t.lastIndexOf(')');
+  const firstOpen = t.indexOf('(', lastClose === -1 ? 0 : lastClose);
+  if (firstOpen !== -1 && (lastClose === -1 || firstOpen > lastClose)) {
+    t = t.slice(0, firstOpen);
+  }
   // Trailing punctuation and unbalanced trailing ')' are trimmed one
   // character at a time.
   for (;;) {
@@ -1369,22 +1376,16 @@ function trimAutolink(text) {
       continue;
     }
     if (last === ')') {
-      let opens = 0;
-      let closes = 0;
-      for (const c of t) { if (c === '(') opens++; else if (c === ')') closes++; }
-      if (closes > opens) { t = t.slice(0, -1); continue; }
+      // The trailing ')' is dropped only when it is unmatched in a
+      // stack scan (stray closing parentheses pair with nothing).
+      let depth = 0;
+      for (let k = 0; k < t.length - 1; k++) {
+        if (t[k] === '(') depth++;
+        else if (t[k] === ')' && depth > 0) depth--;
+      }
+      if (depth === 0) { t = t.slice(0, -1); continue; }
     }
     break;
-  }
-  // An unmatched '(' (when the link does not end in ')') ends the link
-  // just before the first unclosed parenthesis.
-  if (t[t.length - 1] !== ')') {
-    const opens = [];
-    for (let k = 0; k < t.length; k++) {
-      if (t[k] === '(') opens.push(k);
-      else if (t[k] === ')') opens.pop();
-    }
-    if (opens.length) t = t.slice(0, opens[0]);
   }
   return t;
 }
