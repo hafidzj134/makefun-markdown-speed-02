@@ -18,10 +18,14 @@
 
 const ESCAPABLE = '\\!"#$%&\'()*+,-./:;<=>?@[]^_`{|}~';
 
+const UNICODE_PUNCT = /[\p{P}\p{S}]/u;
 function isPunct(ch) {
   const c = ch.charCodeAt(0);
-  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
-         (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+  if (c < 128) {
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+           (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+  }
+  return UNICODE_PUNCT.test(ch);
 }
 
 function isSpace(ch) {
@@ -262,6 +266,7 @@ function tryParseDef(lines, i) {
     if (li < lines.length && RE_BLANK.test(lines[li])) return null;
   }
   if (!closed || label.length > 999) return null;
+  if (normaliseLabel(label) === '') return null;
   if (lines[li][col] !== ':') return null;
   col++;
   // Destination: skip whitespace, crossing at most to the next line(s).
@@ -340,8 +345,7 @@ function tryParseDef(lines, i) {
     // Title may live on the following line(s); failure there is harmless.
     const nl = destLine + 1;
     if (nl < lines.length && !RE_BLANK.test(lines[nl])) {
-      const indentM = /^ {0,3}/.exec(lines[nl]);
-      const tcol = indentM[0].length;
+      const tcol = lines[nl].search(/[^ \t]/);
       const tq = lines[nl][tcol];
       if (tq === '"' || tq === "'" || tq === '(') {
         const st = scanTitle(nl, tcol);
@@ -371,7 +375,7 @@ function tryParseDef(lines, i) {
   };
 }
 
-const TAGLIKE = '<\\/?[A-Za-z][A-Za-z0-9-]*(?:[ \\t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \\t]*=[ \\t]*(?:[^ \\t"\'=<`]+|\'[^\']*\'|"[^"]*"))?)*[ \\t]*\\/?>';
+const TAGLIKE = '(?:<[A-Za-z][A-Za-z0-9-]*(?:[ \\t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \\t]*=[ \\t]*(?:[^ \\t"\'=<`]+|\'[^\']*\'|"[^"]*"))?)*[ \\t]*\\/?>|<\\/[A-Za-z][A-Za-z0-9-]*[ \\t]*>)';
 const RE_TAGLINE = new RegExp('^(?:' + TAGLIKE + '[ \\t]*)+$');
 const RE_SINGLE_TAG = new RegExp('^' + TAGLIKE + '$');
 
@@ -487,7 +491,7 @@ function itemFirstContent(line, lm, baseCol) {
     const ch = line[i];
     if (ch !== ' ' && ch !== '\t') break;
     const w = ch === ' ' ? 1 : 4 - ((baseCol + cols) % 4);
-    if (cols + w > target) out += ' '.repeat(cols + w - target);
+    if (cols + w > target) out += ' '.repeat(cols + w - Math.max(cols, target));
     cols += w;
     i++;
   }
@@ -589,8 +593,17 @@ function stripUpTo(line, indent, baseCol) {
 // Whether a block quote's gathered content currently ends inside a
 // paragraph (so a lazy continuation line may follow).
 function quoteTailIsParagraph(inner) {
-  const last = inner[inner.length - 1];
+  let last = inner[inner.length - 1];
   if (last === undefined || RE_BLANK.test(last)) return false;
+  // Look through nested containers (quote markers, list markers) to the
+  // deepest content line.
+  for (;;) {
+    const st = stripQuoteMarker(last, 0);
+    if (st !== null) { last = st.text; continue; }
+    const lm = listMarker(last, 0);
+    if (lm !== null) { last = itemFirstContent(last, lm, 0); continue; }
+    break;
+  }
   if (measureIndent(last, 0, 4, 0).cols >= 4) return false;
   if (RE_ATX.test(last) || RE_FENCE.test(last) || RE_HR.test(last) ||
       RE_QUOTE.test(last) || RE_SETEXT.test(last)) return false;
@@ -638,7 +651,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripIndent(cl, Math.min(indent, 3), false, baseCol) ?? cl);
+          body.push(stripUpTo(cl, Math.min(indent, 3), baseCol));
           i++;
         }
         void closed;
@@ -767,7 +780,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
             let j = i;
             while (j < n && RE_BLANK.test(lines[j])) j++;
             if (j < n && measureIndent(lines[j], 0, 4, baseCol).cols >= 4) {
-              for (let k = i; k < j; k++) body.push('');
+              for (let k = i; k < j; k++) body.push(stripIndent(lines[k], 4, false, baseCol) ?? '');
               i = j;
               continue;
             }
@@ -808,7 +821,10 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
             const rows = [];
             while (i < n && !RE_BLANK.test(lines[i])) {
               // A body row ends at a line that starts another block.
-              rows.push(splitRow(lines[i]));
+              const rl = lines[i];
+              if (RE_QUOTE.test(rl) || RE_FENCE.test(rl) || RE_ATX.test(rl) ||
+                  RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl)) break;
+              rows.push(splitRow(rl));
               i++;
             }
             tokens.push({ type: 'table', header, align, rows });
@@ -850,6 +866,8 @@ function interruptsParagraph(l, chunk, inItem, baseCol) {
   if (RE_HR.test(l)) return true;
   const lm = listMarker(l, baseCol);
   if (lm) {
+    // An empty list item cannot interrupt a paragraph.
+    if (l.slice(lm.afterPos).trim() === '') return false;
     if (!lm.ordered) return true;
     if (lm.num === 1 || inItem) return true;
   }
@@ -896,6 +914,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
     const firstLine = lines[i];
     const contentIndent = lm.contentIndent;
     const itemLines = [itemFirstContent(firstLine, lm, baseCol)];
+    const itemLazy = new Set();
     i++;
     let itemSawBlank = false;
     let pendingBlanks = 0;
@@ -908,6 +927,8 @@ function lexList(lines, start, firstLm, state, baseCol) {
         while (j < lines.length && RE_BLANK.test(lines[j])) j++;
         if (j >= lines.length) { i = j; lastWasBlankRun = true; break; }
         if (RE_HR.test(lines[j])) { i = j; lastWasBlankRun = true; break; }
+        // An item with no content yet does not resume after a blank line.
+        if (itemLines.every((x) => x === '')) { i = j; lastWasBlankRun = true; break; }
         const nextLm = listMarker(lines[j], baseCol);
         const stripped = stripIndent(lines[j], contentIndent, true, baseCol);
         if (nextLm && nextLm.ordered === ordered &&
@@ -950,6 +971,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
       if (lastLine !== undefined && lastLine !== '' &&
           !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_QUOTE.test(l) &&
           !RE_HR.test(l) && !htmlInterrupts(htmlBlockStart(l))) {
+        itemLazy.add(itemLines.length);
         itemLines.push(stripUpTo(l, contentIndent, baseCol));
         i++;
         continue;
@@ -961,7 +983,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
     const meter = {};
-      items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent, meter));
+      items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent, meter, itemLazy));
       if (meter.blankBetween) loose = true;
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
@@ -1174,24 +1196,10 @@ function matchExtendedAutolink(s, i) {
 
 function trimAutolink(text) {
   let t = text;
-  // Parentheses must balance: cut at the first ')' that unbalances the
-  // text, or before the first '(' that is never closed.
-  {
-    let depth = 0;
-    const opens = [];
-    let cut = -1;
-    for (let k = 0; k < t.length; k++) {
-      if (t[k] === '(') { depth++; opens.push(k); }
-      else if (t[k] === ')') {
-        if (depth === 0) { cut = k; break; }
-        depth--;
-        opens.pop();
-      }
-    }
-    if (cut === -1 && opens.length) cut = opens[0];
-    if (cut !== -1) t = t.slice(0, cut);
-  }
-  while (t.length) {
+  // Trailing punctuation and unbalanced trailing ')' are trimmed one
+  // character at a time.
+  for (;;) {
+    if (!t.length) return t;
     const last = t[t.length - 1];
     if ('?!.,:*_~'.includes(last)) { t = t.slice(0, -1); continue; }
     if (last === ';') {
@@ -1202,7 +1210,23 @@ function trimAutolink(text) {
       t = t.slice(0, -1);
       continue;
     }
+    if (last === ')') {
+      let opens = 0;
+      let closes = 0;
+      for (const c of t) { if (c === '(') opens++; else if (c === ')') closes++; }
+      if (closes > opens) { t = t.slice(0, -1); continue; }
+    }
     break;
+  }
+  // An unmatched '(' (when the link does not end in ')') ends the link
+  // just before the first unclosed parenthesis.
+  if (t[t.length - 1] !== ')') {
+    const opens = [];
+    for (let k = 0; k < t.length; k++) {
+      if (t[k] === '(') opens.push(k);
+      else if (t[k] === ')') opens.pop();
+    }
+    if (opens.length) t = t.slice(0, opens[0]);
   }
   return t;
 }
@@ -1223,7 +1247,13 @@ function parseInline(s, defs, tracker) {
     const ch = s[i];
     if (ch === '\\') {
       const nx = s[i + 1];
-      if (nx === '\n') { flushText(); nodes.push({ t: 'break' }); i += 2; continue; }
+      if (nx === '\n') {
+        flushText();
+        nodes.push({ t: 'break' });
+        i += 2;
+        while (s[i] === ' ' || s[i] === '\t') i++;
+        continue;
+      }
       if (nx !== undefined && isPunct(nx)) {
         // An escaped character is literal: it must not be reinterpreted
         // (e.g. \& must not become an entity reference start).
@@ -1241,6 +1271,7 @@ function parseInline(s, defs, tracker) {
         flushText();
         nodes.push({ t: 'break' });
         i++;
+        while (s[i] === ' ' || s[i] === '\t') i++;
         continue;
       }
       text += ch; i++; continue;
@@ -1400,7 +1431,8 @@ function plainText(s, defs) {
   // Render inline, then strip tags and unescape the few entities the
   // renderer emits; alt text keeps the literal characters.
   const html = parseInline(s, defs, undefined);
-  return html.replace(/<[^>]*>/g, '')
+  return html.replace(/<img[^>]*? alt="([^"]*)"[^>]*?>/g, '$1')
+             .replace(/<[^>]*>/g, '')
              .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
              .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
              .replace(/&amp;/g, '&');
@@ -1468,7 +1500,7 @@ function processEmphasis(nodes) {
     for (let k = ci - 1; k >= 0; k--) {
       const op = nodes[k];
       if (op.t === 'delim' && op.ch === closer.ch && op.canOpen && op.len >= need &&
-          (closer.ch !== '~' || (op.len >= 2) === (closer.len >= 2))) {
+          (closer.ch !== '~' || (op.origLen === closer.origLen && op.origLen <= 2))) {
         // Rule of three for * and _.
         if (closer.ch !== '~' &&
             (op.canClose || closer.canOpen) &&
@@ -1484,7 +1516,7 @@ function processEmphasis(nodes) {
     const opener = nodes[oi];
     let use;
     let tag;
-    if (closer.ch === '~') { use = opener.len >= 2 && closer.len >= 2 ? 2 : 1; tag = 'del'; }
+    if (closer.ch === '~') { use = opener.len; tag = 'del'; }
     else if (opener.len >= 2 && closer.len >= 2) { use = 2; tag = 'strong'; }
     else { use = 1; tag = 'em'; }
     opener.len -= use;
