@@ -724,7 +724,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripFenceLine(cl, Math.min(indent, 3), baseCol));
+          body.push(stripUpTo(cl, Math.min(indent, 3), baseCol));
           i++;
         }
         void closed;
