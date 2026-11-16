@@ -1160,37 +1160,68 @@ const RE_TAG = new RegExp(
 
 // Find the index of the ']' that closes a bracket opened just before pos,
 // honouring escapes, code spans and nested brackets. Returns -1 if none.
-function findClosingBracket(s, pos, forRegion) {
+function findClosingBracket(s, pos, strict) {
   let depth = 1;
   let i = pos;
   while (i < s.length) {
     const ch = s[i];
     if (ch === '\\') { i += 2; continue; }
     if (ch === '`') {
-      // Skip a code span. An unmatched run is literal text and does
-      // not hide the closing bracket. A complete span whose content
-      // itself contains a backtick defeats the link entirely (but not
-      // the wider scan for a failed-link region, which only needs the
-      // bracket structure).
       let n = 0;
       while (s[i] === '`') { n++; i++; }
+      if (!strict) {
+        // Permissive scan (reference-label fallback and failed-link
+        // regions): skip a complete equal-length span; an unmatched
+        // run is literal text and does not hide the closing bracket.
+        let j = i;
+        let closedSpan = false;
+        let closeStart = -1;
+        while (j < s.length) {
+          if (s[j] === '`') {
+            let m = 0;
+            const st = j;
+            while (s[j] === '`') { m++; j++; }
+            if (m === n) { closedSpan = true; closeStart = st; break; }
+          } else j++;
+        }
+        if (closedSpan) {
+          const content = s.slice(i, closeStart);
+          if (!(content.includes('`') && content.includes(']('))) i = j;
+        }
+        continue;
+      }
+      // Strict scan (link text for inline and reference links). Every
+      // backtick run must pair up or the link fails:
+      // (1) with the nearest equal-length run whose content holds no
+      //     ']' — a span whose content itself contains a backtick
+      //     defeats the link unless it ends right at the bracket;
+      // (2) failing that, with the next run of any length (the
+      //     content between them then holds no backtick at all);
+      // (3) with no later run at all the run is unclosed and the
+      //     link fails.
       let j = i;
-      let closedSpan = false;
-      let closeStart = -1;
+      let eqEnd = -1;
+      let eqCloseStart = -1;
       while (j < s.length) {
         if (s[j] === '`') {
           let m = 0;
           const st = j;
           while (s[j] === '`') { m++; j++; }
-          if (m === n) { closedSpan = true; closeStart = st; break; }
-        } else j++;
+          if (m === n) { eqEnd = j; eqCloseStart = st; break; }
+        } else if (s[j] === ']') break;
+        else j++;
       }
-      if (closedSpan) {
-        // A span whose content contains a backtick is only tolerated
-        // when it sits at the very end of the link text.
-        if (!forRegion && s.slice(i, closeStart).includes('`') && s[j] !== ']') return -1;
-        i = j;
+      if (eqEnd !== -1) {
+        const content = s.slice(i, eqCloseStart);
+        if (content.includes('`') && s[eqEnd] !== ']') return -1;
+        i = eqEnd;
+        continue;
       }
+      j = i;
+      while (j < s.length && s[j] !== '`') j++;
+      if (j >= s.length) return -1;
+      while (s[j] === '`') j++;
+      i = j;
       continue;
     }
     if (ch === '<') {
@@ -1417,8 +1448,194 @@ function scanParenRegion(s, pos) {
 // outer link when an inner one won. With `suppressEm` set (the region of
 // a failed inline link), emphasis and strikethrough never form, though
 // code spans, links and autolinks inside still do.
+// Label scan for the emphasis mask's link pattern: code spans are
+// atoms whose opening and closing runs have exactly the same length
+// (the content may hold shorter or longer runs, brackets and any
+// other characters). Returns the index of the closing ']' or -1.
+function scanStrictLabel(s, pos) {
+  let depth = 1;
+  let i = pos;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let n = 0;
+      while (s[i] === '`') { n++; i++; }
+      let j = i;
+      let end = -1;
+      while (j < s.length) {
+        if (s[j] === '`') {
+          let m = 0;
+          while (s[j] === '`') { m++; j++; }
+          if (m === n) { end = j; break; }
+        } else j++;
+      }
+      if (end === -1) return -1;
+      i = end;
+      continue;
+    }
+    if (c === '<') {
+      const tm = RE_TAG.exec(s.slice(i));
+      if (tm) { i += tm[0].length; continue; }
+      const nx = s[i + 1];
+      if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
+        const gt = s.indexOf('>', i + 1);
+        if (gt !== -1) { i = gt + 1; continue; }
+      }
+      i++;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
+// Label scan with no backtick grammar at all (bracket counting only).
+function scanSimpleLabel(s, pos) {
+  let depth = 1;
+  let i = pos;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '<') {
+      const tm = RE_TAG.exec(s.slice(i));
+      if (tm) { i += tm[0].length; continue; }
+      const nx = s[i + 1];
+      if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
+        const gt = s.indexOf('>', i + 1);
+        if (gt !== -1) { i = gt + 1; continue; }
+      }
+      i++;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
+// Permissive destination scan for the mask's link pattern: finds the
+// ')' that closes the destination part starting at s[pos] === '('.
+// Backticks are ordinary characters here. Returns the index just
+// after the ')' or -1.
+function scanDestEnd(s, pos) {
+  let i = pos + 1;
+  const skipWs = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  skipWs();
+  if (s[i] === '<') {
+    i++;
+    while (i < s.length && s[i] !== '>') { if (s[i] === '\\') i++; i++; }
+    if (i >= s.length) return -1;
+    i++;
+  } else {
+    let depth = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === '\\') { i += 2; continue; }
+      if (c === '(') depth++;
+      else if (c === ')') { if (depth === 0) break; depth--; }
+      else if (/\s/.test(c) && depth === 0) break;
+      i++;
+    }
+  }
+  skipWs();
+  const q = s[i];
+  if (q === '"' || q === "'") {
+    i++;
+    while (i < s.length && s[i] !== q) { if (s[i] === '\\') i++; i++; }
+    if (i >= s.length) return -1;
+    i++;
+  } else if (q === '(') {
+    i++;
+    while (i < s.length && s[i] !== ')') { if (s[i] === '\\') i++; i++; }
+    if (i >= s.length) return -1;
+    i++;
+  }
+  skipWs();
+  return s[i] === ')' ? i + 1 : -1;
+}
+
+// The emphasis delimiter scan of the reference renderer works on the
+// raw block text: it pairs backtick runs into code spans globally,
+// ignoring link boundaries — except that whole link constructs whose
+// label is backtick-balanced, full reference links, shortcut
+// references and raw HTML are skipped as units, so their backticks
+// never join the pairing. An emphasis delimiter that lands inside
+// one of the globally paired spans does not exist for emphasis.
+// This computes the set of paired-span intervals for one inline
+// string, as a per-character mask.
+function computeCodeMask(s) {
+  const mask = new Uint8Array(s.length);
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '`') {
+      let n = 0;
+      const rs = i;
+      while (s[i] === '`') { n++; i++; }
+      let j = i;
+      let end = -1;
+      while (j < s.length) {
+        if (s[j] === '`') {
+          let m = 0;
+          while (s[j] === '`') { m++; j++; }
+          if (m === n) { end = j; break; }
+        } else j++;
+      }
+      if (end !== -1) {
+        for (let k = rs; k < end; k++) mask[k] = 1;
+        i = end;
+      }
+      continue;
+    }
+    if (c === '<') {
+      const rest = s.slice(i);
+      const tm = RE_TAG.exec(rest) || RE_AUTOLINK.exec(rest) || RE_EMAIL_LINK.exec(rest);
+      if (tm) { i += tm[0].length; continue; }
+      i++;
+      continue;
+    }
+    if (c === '[' || (c === '!' && s[i + 1] === '[')) {
+      const openPos = c === '!' ? i + 1 : i;
+      const le = scanStrictLabel(s, openPos + 1);
+      const le2 = le === -1 ? scanSimpleLabel(s, openPos + 1) : -1;
+      const labelEnd = le !== -1 ? le : le2;
+      if (labelEnd === -1) { i++; continue; }
+      const after = labelEnd + 1;
+      if (s[after] === '(') {
+        // Inline link: skipped as a unit only when the label is
+        // backtick-balanced and the destination closes. Otherwise
+        // the scan walks into the text and its backtick runs pair
+        // globally (the collapsed form behaves the same way).
+        if (le !== -1) {
+          const de = scanDestEnd(s, after);
+          if (de !== -1) { i = de; continue; }
+        }
+        i++;
+        continue;
+      }
+      if (s[after] === '[') {
+        if (s[after + 1] === ']') { i++; continue; } // collapsed: pooled
+        const le3 = scanSimpleLabel(s, after + 1);
+        if (le3 !== -1) { i = le3 + 1; continue; } // full reference: skipped
+        i++;
+        continue;
+      }
+      i = after; // shortcut or bare brackets: skipped
+      continue;
+    }
+    i++;
+  }
+  return mask;
+}
+
 function parseInline(s, ctx, tracker, inLink, suppressEm) {
   const defs = ctx.defs;
+  const codeMask = suppressEm ? null : computeCodeMask(s);
   const nodes = [];
   let text = '';
   const flushText = () => {
@@ -1523,7 +1740,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
     if (ch === '[' || (ch === '!' && s[i + 1] === '[')) {
       const isImage = ch === '!';
       const openPos = isImage ? i + 1 : i;
-      const close = findClosingBracket(s, openPos + 1);
+      const close = findClosingBracket(s, openPos + 1, true);
       if (close !== -1) {
         const linkText = s.slice(openPos + 1, close);
         let href = null;
@@ -1535,7 +1752,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           if (d) { href = d.href; title = d.title; end = d.end; }
         }
         if (end === -1 && s[after] === '[') {
-          const close2 = findClosingBracket(s, after + 1);
+          const close2 = findClosingBracket(s, after + 1, true);
           if (close2 !== -1) {
             const rawLabel = s.slice(after + 1, close2);
             const label = rawLabel === '' ? linkText : rawLabel;
@@ -1555,7 +1772,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           // with emphasis suppressed inside it. The bracket scan for
           // the region is the permissive one (a backtick-bearing code
           // span in the text defeats the link but not the region).
-          const rclose = close !== -1 ? close : findClosingBracket(s, openPos + 1, true);
+          const rclose = close !== -1 ? close : findClosingBracket(s, openPos + 1, false);
           if (rclose !== -1 && s[rclose + 1] === '(') {
             const regionEnd = scanParenRegion(s, rclose + 1);
             if (regionEnd !== -1) {
@@ -1593,11 +1810,47 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           // An inner link won: the outer brackets stay literal.
         }
       }
+      if (close === -1) {
+        // The strict scan rejected the label (an unclosed backtick
+        // run, or a backtick-bearing span not at the end). A shortcut
+        // reference may still use the bracketed text: its label scan
+        // is the permissive one. This never applies when an inline
+        // destination or a second label follows the bracket.
+        const pclose = findClosingBracket(s, openPos + 1, false);
+        if (pclose !== -1 && s[pclose + 1] !== '(' && s[pclose + 1] !== '[') {
+          const pText = s.slice(openPos + 1, pclose);
+          const def = defs.get(normaliseLabel(pText));
+          if (def) {
+            if (isImage) {
+              flushText();
+              const alt = plainText(pText, ctx);
+              let tag = '<img src="' + escapeAttr(cleanHref(def.href)) + '" alt="' + escapeAttr(alt) + '"';
+              if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
+              tag += '>';
+              nodes.push({ t: 'html', s: tag });
+              i = pclose + 1;
+              continue;
+            }
+            const innerTracker = { link: false };
+            const inner = parseInline(pText, ctx, innerTracker, true);
+            if (!innerTracker.link) {
+              flushText();
+              let tag = '<a href="' + escapeAttr(cleanHref(def.href)) + '"';
+              if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
+              tag += '>' + inner + '</a>';
+              nodes.push({ t: 'html', s: tag });
+              if (tracker) tracker.link = true;
+              i = pclose + 1;
+              continue;
+            }
+          }
+        }
+      }
       if (close === -1 && !suppressEm) {
         // The strict bracket scan found no link (for example a
         // backtick-bearing code span in the text), but a failed-link
         // region may still start here.
-        const rclose = findClosingBracket(s, openPos + 1, true);
+        const rclose = findClosingBracket(s, openPos + 1, false);
         if (rclose !== -1 && s[rclose + 1] === '(') {
           const regionEnd = scanParenRegion(s, rclose + 1);
           if (regionEnd !== -1) {
@@ -1612,9 +1865,14 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
       text += ch; i++; continue;
     }
     if (ch === '*' || ch === '_' || ch === '~') {
+      const runStart = i;
       let run = 0;
       while (s[i] === ch) { run++; i++; }
-      if (suppressEm) { text += ch.repeat(run); continue; }
+      if (suppressEm || (codeMask !== null && codeMask[runStart] === 1)) {
+        // Inside a globally paired code span (see computeCodeMask)
+        // the delimiter does not exist for emphasis.
+        text += ch.repeat(run); continue;
+      }
       flushText();
       nodes.push({ t: 'delim', ch, len: run, origLen: run, s: s.slice(i - run, i) });
       continue;
@@ -1627,7 +1885,8 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
       const auto = matchExtendedAutolink(s, i);
       if (auto) {
         flushText();
-        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(auto.href)) + '">' + escapeText(auto.text) + '</a>' });
+        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(auto.href)) + '">' + escapeText(auto.text) + '</a>',
+                     fc: auto.text[0], lc: auto.text[auto.text.length - 1] });
         i = auto.end;
         continue;
       }
@@ -1642,9 +1901,10 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           // Followed by an underscore run: only a link when that run
           // turns out to close an emphasis span around this address
           // (decided after delimiter processing).
-          nodes.push({ t: 'emailcand', s: em.addr });
+          nodes.push({ t: 'emailcand', s: em.addr, fc: em.addr[0], lc: em.addr[em.addr.length - 1] });
         } else {
-          nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(em.addr) + '">' + escapeText(em.addr) + '</a>' });
+          nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(em.addr) + '">' + escapeText(em.addr) + '</a>',
+                       fc: em.addr[0], lc: em.addr[em.addr.length - 1] });
         }
         i += em.addr.length;
         continue;
@@ -1701,6 +1961,7 @@ function nodeCharBefore(nodes, idx) {
     if (nd.t === 'text') return nd.s[nd.s.length - 1];
     if (nd.t === 'delim') return nd.ch;
     if (nd.t === 'break') return ' ';
+    if (nd.lc !== undefined) return nd.lc;
     return '!';
   }
   return null;
@@ -1712,6 +1973,7 @@ function nodeCharAfter(nodes, idx) {
     if (nd.t === 'text') return nd.s[0];
     if (nd.t === 'delim') return nd.ch;
     if (nd.t === 'break') return ' ';
+    if (nd.fc !== undefined) return nd.fc;
     return '!';
   }
   return null;
@@ -1757,12 +2019,45 @@ function poisonState(nodes, oi, ci, tag, ch, closerLen, use) {
     const B = nodes[bi];
     if (B.t === 'delim' && B.ch === ch) {
       if (B.len >= 2) continue; // a longer run absorbs the attachment
-      if (!/\s/.test(A.s)) continue; // a lone delimiter rescues it
+      // A lone delimiter rescues the attachment only when it is itself
+      // followed by whitespace or by the end of the content.
+      const ci2 = nextIdx(bi + 1);
+      const followed = ci2 === -1 ||
+        (nodes[ci2].t === 'text' && /^\s/.test(nodes[ci2].s)) ||
+        nodes[ci2].t === 'break';
+      if (!/\s/.test(A.s) && followed) continue;
       return 'poison';
     }
     return 'poison';
   }
   return null;
+}
+
+// Whether the content between opener (index oi) and closer (index ci)
+// ends with a nested emphasis span (same delimiter character) that
+// starts after whitespace and is followed by attached word text
+// running right up to the closer — the shape that makes a lone closing
+// delimiter part of the content instead of a closer.
+function rescueShape(nodes, oi, ci, ch) {
+  const visible = (nd) => nd !== undefined && !(nd.t === 'delim' && nd.len === 0);
+  for (let k = oi + 1; k < ci; k++) {
+    const E = nodes[k];
+    if (E.t !== 'elem' || E.tag !== 'em' || E.ch !== ch) continue;
+    let prev;
+    for (let p = k - 1; p > oi; p--) if (visible(nodes[p])) { prev = nodes[p]; break; }
+    const preceded = prev !== undefined &&
+      ((prev.t === 'text' && /\s$/.test(prev.s)) || prev.t === 'break');
+    if (!preceded) continue;
+    let A;
+    let aIdx = -1;
+    for (let q = k + 1; q < ci; q++) if (visible(nodes[q])) { A = nodes[q]; aIdx = q; break; }
+    if (A === undefined || A.t !== 'text') continue;
+    if (!/^[\p{L}\p{N}]/u.test(A.s)) continue;
+    let hasMore = false;
+    for (let q = aIdx + 1; q < ci; q++) if (visible(nodes[q])) { hasMore = true; break; }
+    if (!hasMore) return true;
+  }
+  return false;
 }
 
 // CommonMark-style delimiter processing for *, _ and ~~.
@@ -1790,7 +2085,10 @@ function processEmphasis(nodes) {
       nd.canClose = rightFlanking;
     }
   }
-  // Match closers to openers.
+  // Match closers to openers. An opener whose pairing for a given
+  // tag was rejected by the poison rule stays rejected for that tag:
+  // the recursive matcher does not retry it against a later closer.
+  const poisonedOpeners = new Map();
   let ci = 0;
   while (ci < nodes.length) {
     const closer = nodes[ci];
@@ -1809,6 +2107,11 @@ function processEmphasis(nodes) {
             (op.origLen + closer.origLen) % 3 === 0 &&
             !(op.origLen % 3 === 0 && closer.origLen % 3 === 0)) {
           continue;
+        }
+        if (closer.ch !== '~') {
+          const ptag = (op.len >= 2 && closer.len >= 2) ? 'strong' : 'em';
+          const ps = poisonedOpeners.get(op);
+          if (ps !== undefined && ps.has(ptag)) continue;
         }
         oi = k;
         break;
@@ -1829,8 +2132,23 @@ function processEmphasis(nodes) {
     // excess character of the closing run (see poisonState).
     let absorbStar = false;
     if (closer.ch !== '~') {
+      // A single delimiter closing over a longer opening run does not
+      // pair when the content between them ends with the rescued
+      // attachment shape (a nested emphasis followed by attached
+      // text): that delimiter belongs to the content as a literal.
+      if (tag === 'em' && opener.len >= 2 && closer.len === 1 &&
+          rescueShape(nodes, oi, ci, closer.ch)) {
+        ci++;
+        continue;
+      }
       const pz = poisonState(nodes, oi, ci, tag, closer.ch, closer.len, use);
-      if (pz === 'poison') { ci++; continue; }
+      if (pz === 'poison') {
+        let ps = poisonedOpeners.get(opener);
+        if (ps === undefined) { ps = new Set(); poisonedOpeners.set(opener, ps); }
+        ps.add(tag);
+        ci++;
+        continue;
+      }
       if (pz === 'rescue') { absorbStar = true; closer.len -= 1; }
     }
     opener.len -= use;
