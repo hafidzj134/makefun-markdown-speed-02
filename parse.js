@@ -629,6 +629,13 @@ function stripUpTo(line, indent, baseCol) {
   return line.slice(i);
 }
 
+// Whether a line opens a (valid) fenced code block: a backtick fence
+// whose info string contains a backtick is not a fence at all.
+function isFenceLine(l) {
+  const f = RE_FENCE.exec(l);
+  return !!f && !(f[1][0] === '`' && f[2].includes('`'));
+}
+
 // Whether a block quote's gathered content currently ends inside a
 // paragraph (so a lazy continuation line may follow).
 function quoteTailIsParagraph(inner) {
@@ -644,7 +651,7 @@ function quoteTailIsParagraph(inner) {
     break;
   }
   if (measureIndent(last, 0, 4, 0).cols >= 4) return false;
-  if (RE_ATX.test(last) || RE_FENCE.test(last) || RE_HR.test(last) ||
+  if (RE_ATX.test(last) || isFenceLine(last) || RE_HR.test(last) ||
       RE_QUOTE.test(last) || RE_SETEXT.test(last)) return false;
   if (listMarker(last, 0)) return false;
   if (htmlBlockStart(last)) return false;
@@ -774,7 +781,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         // code block is open inside the quote.
         if (openFence === null && inner.length &&
             quoteTailIsParagraph(inner) &&
-            !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_HR.test(l) &&
+            !RE_ATX.test(l) && !isFenceLine(l) && !RE_HR.test(l) &&
             !RE_QUOTE.test(l) && !listMarker(l, baseCol) && !htmlInterrupts(htmlBlockStart(l))) {
           let lazyLine = l;
           const ind = measureIndent(l, 0, 5, baseCol);
@@ -876,7 +883,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
                 break;
               }
               // A body row ends at a line that starts another block.
-              if (RE_QUOTE.test(rl) || RE_FENCE.test(rl) || RE_ATX.test(rl) ||
+              if (RE_QUOTE.test(rl) || isFenceLine(rl) || RE_ATX.test(rl) ||
                   RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl) ||
                   measureIndent(rl, 0, 4, baseCol).cols >= 4) break;
               rows.push(splitRow(rl));
@@ -1031,7 +1038,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
       // Laziness: paragraph continuation lines may be unindented.
       const lastLine = itemLines[itemLines.length - 1];
       if (lastLine !== undefined && lastLine !== '' &&
-          !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_QUOTE.test(l) &&
+          !RE_ATX.test(l) && !isFenceLine(l) && !RE_QUOTE.test(l) &&
           !RE_HR.test(l) && !htmlInterrupts(htmlBlockStart(l))) {
         itemLazy.add(itemLines.length);
         itemLines.push(stripUpTo(l, contentIndent, baseCol));
@@ -1086,18 +1093,20 @@ function findClosingBracket(s, pos) {
     const ch = s[i];
     if (ch === '\\') { i += 2; continue; }
     if (ch === '`') {
-      // Skip a code span.
+      // Skip a code span. An unmatched run is literal text and does
+      // not hide the closing bracket.
       let n = 0;
       while (s[i] === '`') { n++; i++; }
+      let j = i;
       let closedSpan = false;
-      while (i < s.length) {
-        if (s[i] === '`') {
+      while (j < s.length) {
+        if (s[j] === '`') {
           let m = 0;
-          while (s[i] === '`') { m++; i++; }
+          while (s[j] === '`') { m++; j++; }
           if (m === n) { closedSpan = true; break; }
-        } else i++;
+        } else j++;
       }
-      if (!closedSpan) return -1;
+      if (closedSpan) { i = j; continue; }
       continue;
     }
     if (ch === '<') {
@@ -1191,11 +1200,13 @@ function parseInlineDest(s, pos) {
   return { href: unescapeString(href), title: title === null ? null : unescapeString(title), end: i + 1 };
 }
 
-const RE_EMAIL_CORE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+/;
+const RE_EMAIL_CORE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)+/;
 
-// Match an e-mail core at s[i..]; returns the address or null. A match is
-// rejected when the character right after it could extend the domain
-// (letter/digit would have been consumed; '-' or '_' invalidate it).
+// Match an e-mail core at s[i..]; returns { addr, cand } or null. A
+// match is rejected when the character right after it could extend the
+// domain (letter/digit would have been consumed; '-' invalidates it).
+// A trailing '_' makes it a candidate: the address links only when the
+// underscore run actually closes an emphasis span around it.
 function matchEmailCore(s, i) {
   const m = RE_EMAIL_CORE.exec(s.slice(i));
   if (!m) return null;
@@ -1203,8 +1214,8 @@ function matchEmailCore(s, i) {
   const local = addr.slice(0, addr.indexOf('@'));
   if (local.startsWith('.') || local.endsWith('.')) return null;
   const next = s[i + addr.length];
-  if (next !== undefined && /[A-Za-z0-9_-]/.test(next)) return null;
-  return addr;
+  if (next !== undefined && /[A-Za-z0-9-]/.test(next)) return null;
+  return { addr, cand: next === '_' };
 }
 
 // Extended autolinks in running text (GFM): www., http://, https://,
@@ -1213,7 +1224,8 @@ function matchExtendedAutolink(s, i) {
   const head = s.slice(i, i + 8).toLowerCase();
   // mailto:address — the prefix is part of the link text.
   if (head.startsWith('mailto:')) {
-    const addr = matchEmailCore(s, i + 7);
+    const em = matchEmailCore(s, i + 7);
+    const addr = em && !em.cand ? em.addr : null;
     if (addr) {
       const text = s.slice(i, i + 7) + addr;
       return { text, href: 'mailto:' + addr, end: i + text.length };
@@ -1222,7 +1234,8 @@ function matchExtendedAutolink(s, i) {
   }
   // xmpp:address[/segment] — one optional single-segment path.
   if (head.startsWith('xmpp:')) {
-    const addr = matchEmailCore(s, i + 5);
+    const em = matchEmailCore(s, i + 5);
+    const addr = em && !em.cand ? em.addr : null;
     if (addr) {
       let text = s.slice(i, i + 5) + addr;
       let end = i + text.length;
@@ -1298,7 +1311,8 @@ function trimAutolink(text) {
 // Links may not contain links: `tracker`, when given, records whether a
 // link was formed, so a caller parsing candidate link text can reject the
 // outer link when an inner one won.
-function parseInline(s, defs, tracker, inLink) {
+function parseInline(s, ctx, tracker, inLink) {
+  const defs = ctx.defs;
   const nodes = [];
   let text = '';
   const flushText = () => {
@@ -1390,6 +1404,11 @@ function parseInline(s, defs, tracker, inLink) {
       if (m) {
         flushText();
         nodes.push({ t: 'html', s: m[0] });
+        // A raw <a> tag switches the rest of the document's inline
+        // stream into "inside a link" mode (extended autolinks and
+        // bare emails stop linking) until a </a> tag appears.
+        if (/^<a[\s/>]/i.test(m[0])) ctx.inLink = true;
+        else if (/^<\/a\s*>/.test(m[0])) ctx.inLink = false;
         i += m[0].length;
         continue;
       }
@@ -1427,7 +1446,7 @@ function parseInline(s, defs, tracker, inLink) {
         if (end !== -1) {
           if (isImage) {
             flushText();
-            const alt = plainText(linkText, defs);
+            const alt = plainText(linkText, ctx);
             let tag = '<img src="' + escapeAttr(cleanHref(href)) + '" alt="' + escapeAttr(alt) + '"';
             if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
             tag += '>';
@@ -1436,7 +1455,7 @@ function parseInline(s, defs, tracker, inLink) {
             continue;
           }
           const innerTracker = { link: false };
-          const inner = parseInline(linkText, defs, innerTracker, true);
+          const inner = parseInline(linkText, ctx, innerTracker, true);
           if (!innerTracker.link) {
             flushText();
             let tag = '<a href="' + escapeAttr(cleanHref(href)) + '"';
@@ -1461,7 +1480,7 @@ function parseInline(s, defs, tracker, inLink) {
     }
     // Extended autolinks starting inside running text.
     const chLow = (ch >= 'A' && ch <= 'Z') ? ch.toLowerCase() : ch;
-    if (!inLink &&
+    if (!inLink && !ctx.inLink &&
         (chLow === 'w' || chLow === 'h' || chLow === 'f' || chLow === 'm' || chLow === 'x') &&
         (i === 0 || !/[A-Za-z0-9]/.test(s[i - 1]))) {
       const auto = matchExtendedAutolink(s, i);
@@ -1472,14 +1491,21 @@ function parseInline(s, defs, tracker, inLink) {
         continue;
       }
     }
-    if (!inLink &&
+    if (!inLink && !ctx.inLink &&
         (ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') &&
         (i === 0 || !/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i - 1]))) {
-      const addr = matchEmailCore(s, i);
-      if (addr) {
+      const em = matchEmailCore(s, i);
+      if (em) {
         flushText();
-        nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(addr) + '">' + escapeText(addr) + '</a>' });
-        i += addr.length;
+        if (em.cand) {
+          // Followed by an underscore run: only a link when that run
+          // turns out to close an emphasis span around this address
+          // (decided after delimiter processing).
+          nodes.push({ t: 'emailcand', s: em.addr });
+        } else {
+          nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(em.addr) + '">' + escapeText(em.addr) + '</a>' });
+        }
+        i += em.addr.length;
         continue;
       }
     }
@@ -1488,14 +1514,36 @@ function parseInline(s, defs, tracker, inLink) {
   }
   flushText();
   processEmphasis(nodes, s);
+  resolveEmailCands(nodes, false);
   return renderNodes(nodes);
 }
 
+// Decide candidate bare e-mail nodes: an address followed by an
+// underscore run is a link only when the run closed an emphasis span
+// around it — visible now as the address being the last child of an
+// element, or the following delimiter having been partly consumed.
+function resolveEmailCands(nodes, insideElem) {
+  for (let k = 0; k < nodes.length; k++) {
+    const nd = nodes[k];
+    if (nd.t === 'elem') { resolveEmailCands(nd.children, true); continue; }
+    if (nd.t !== 'emailcand') continue;
+    const next = nodes[k + 1];
+    const approved = (insideElem && k === nodes.length - 1) ||
+      (next !== undefined && next.t === 'delim' && next.len < next.origLen);
+    if (approved) {
+      nd.t = 'html';
+      nd.s = '<a href="mailto:' + escapeAttr(nd.s) + '">' + escapeText(nd.s) + '</a>';
+    } else {
+      nd.t = 'text';
+    }
+  }
+}
+
 // Plain-text content of a markup string (for image alt attributes).
-function plainText(s, defs) {
+function plainText(s, ctx) {
   // Render inline, then strip tags and unescape the few entities the
   // renderer emits; alt text keeps the literal characters.
-  const html = parseInline(s, defs, undefined);
+  const html = parseInline(s, ctx, undefined);
   return html.replace(/<img[^>]*? alt="([^"]*)"[^>]*?>/g, '$1')
              .replace(/<[^>]*>/g, '')
              .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -1623,13 +1671,13 @@ function renderTokens(tokens, state, tight) {
     const tok = tokens[k];
     switch (tok.type) {
       case 'heading':
-        out += '<h' + tok.depth + '>' + parseInline(tok.text, state.defs, false) + '</h' + tok.depth + '>\n';
+        out += '<h' + tok.depth + '>' + parseInline(tok.text, state, false) + '</h' + tok.depth + '>\n';
         break;
       case 'paragraph':
         if (tight) {
-          out += parseInline(tok.text, state.defs, false);
+          out += parseInline(tok.text, state, false);
         } else {
-          out += '<p>' + parseInline(tok.text, state.defs, false) + '</p>\n';
+          out += '<p>' + parseInline(tok.text, state, false) + '</p>\n';
         }
         break;
       case 'code':
@@ -1694,8 +1742,8 @@ function renderListItem(item, list, state) {
     // directly in front of its bare inline content).
     const first = item[0];
     const firstHtml = tight
-      ? checkbox + parseInline(first.text, state.defs, false)
-      : '<p>' + checkbox + parseInline(first.text, state.defs, false) + '</p>\n';
+      ? checkbox + parseInline(first.text, state, false)
+      : '<p>' + checkbox + parseInline(first.text, state, false) + '</p>\n';
     inner = firstHtml + renderTokens(item.slice(1), state, tight);
   } else {
     inner = renderTokens(item, state, tight);
@@ -1709,7 +1757,7 @@ function renderTable(tok, state) {
   for (let c = 0; c < tok.header.length; c++) {
     const a = tok.align[c];
     out += '<th' + (a ? ' align="' + a + '"' : '') + '>' +
-           parseInline(tok.header[c], state.defs, false) + '</th>\n';
+           parseInline(tok.header[c], state, false) + '</th>\n';
   }
   out += '</tr>\n</thead>\n';
   if (tok.rows.length) {
@@ -1719,7 +1767,7 @@ function renderTable(tok, state) {
       for (let c = 0; c < tok.header.length; c++) {
         const a = tok.align[c];
         out += '<td' + (a ? ' align="' + a + '"' : '') + '>' +
-               parseInline(row[c] ?? '', state.defs, false) + '</td>\n';
+               parseInline(row[c] ?? '', state, false) + '</td>\n';
       }
       out += '</tr>\n';
     }
@@ -1737,7 +1785,7 @@ export function parse(markdown) {
   if (typeof markdown !== 'string') markdown = String(markdown ?? '');
   const src = markdown.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
-  const state = { defs: new Map() };
+  const state = { defs: new Map(), inLink: false };
   const tokens = lexBlocks(lines, state);
   // Mark html tokens that run to end-of-input (no trailing newline added).
   markEof(tokens, lines);
