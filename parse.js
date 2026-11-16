@@ -26,7 +26,9 @@ function isPunct(ch) {
 
 function isSpace(ch) {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' ||
-         ch === '\f' || ch === '\v';
+         ch === '\f' || ch === '\v' || ch === '\u00a0' || ch === '\u1680' ||
+         (ch >= '\u2000' && ch <= '\u200a') || ch === '\u202f' ||
+         ch === '\u205f' || ch === '\u3000' || ch === '\ufeff';
 }
 
 // Escape text-node content: &, <, > — but leave well-formed entity
@@ -208,126 +210,147 @@ const RE_DEF_START = /^ {0,3}\[/;
 const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul').split(' '));
 
 // Try to parse a link reference definition starting at lines[i].
-// Returns { lines: n, label, href, title } or null. May span up to 3 lines:
-// the label line, the destination (possibly on the next line), and the
-// title (possibly on the line after the destination).
+// Returns { lines: n, label, href, title } or null. The label, the
+// destination and the title may each start on a following line, and a
+// title may span several lines; but junk after a same-line title (or
+// other trailing text on the destination line) invalidates the whole
+// definition, while a failed title on a FOLLOWING line simply leaves a
+// title-less definition that ends at the destination line.
 function tryParseDef(lines, i) {
   const first = lines[i];
-  let m = /^ {0,3}\[/.exec(first);
+  const m = /^ {0,3}\[/.exec(first);
   if (!m) return null;
-  let rest = first.slice(m[0].length);
-  // Label: up to first unescaped ], may span lines.
-  let label = '';
   let li = i;
+  let col = m[0].length;
+  // Label: up to the first unescaped ], may span lines.
+  let label = '';
   let closed = false;
-  let cur = rest;
-  while (true) {
-    let j = 0;
-    while (j < cur.length) {
-      const ch = cur[j];
-      if (ch === '\\') { j += 2; continue; }
-      if (ch === '[') return null; // unescaped [ inside label
-      if (ch === ']') { closed = true; break; }
+  while (li < lines.length && li - i <= 20) {
+    const line = lines[li];
+    let j = col;
+    let broke = false;
+    while (j < line.length) {
+      const ch = line[j];
+      if (ch === '\\') { label += ch + (line[j + 1] ?? ''); j += 2; continue; }
+      if (ch === '[') return null;
+      if (ch === ']') { closed = true; col = j + 1; broke = true; break; }
+      label += ch;
       j++;
     }
-    if (closed) {
-      label += cur.slice(0, j);
-      cur = cur.slice(j + 1);
-      break;
-    }
-    label += cur + '\n';
+    if (broke) break;
+    label += '\n';
     li++;
-    if (li >= lines.length || li - i > 2) return null;
-    if (RE_BLANK.test(lines[li])) return null;
-    cur = lines[li];
+    col = 0;
+    if (li < lines.length && RE_BLANK.test(lines[li])) return null;
   }
-  if (label.length > 999) return null;
-  // Expect ':' right after ]
-  let after = cur;
-  if (after[0] !== ':') return null;
-  after = after.slice(1);
-  // Destination: either <...> or a run of non-space chars with balanced
-  // parens; may start on the following line.
-  let href = null;
-  let title = null;
-  let usedLines = li - i;
-  let pending = after;
-  const skipWsLines = () => {
-    // Advance over spaces/tabs; if we hit end of line, move to next line
-    // (at most one blank-free step, and the def may use at most 3 lines).
+  if (!closed || label.length > 999) return null;
+  if (lines[li][col] !== ':') return null;
+  col++;
+  // Destination: skip whitespace, crossing at most to the next line(s).
+  const skipWs = () => {
     while (true) {
-      pending = pending.replace(/^[ \t]+/, '');
-      if (pending.length > 0) return true;
-      if (usedLines >= 2) return false;
-      const nl = lines[i + usedLines + 1];
-      if (nl === undefined || RE_BLANK.test(nl)) return false;
-      usedLines++;
-      pending = nl;
+      const line = lines[li];
+      while (col < line.length && (line[col] === ' ' || line[col] === '\t')) col++;
+      if (col < line.length) return true;
+      if (li + 1 >= lines.length || RE_BLANK.test(lines[li + 1])) return false;
+      li++;
+      col = 0;
     }
   };
-  if (!skipWsLines()) return null;
-  if (pending[0] === '<') {
-    const close = pending.indexOf('>');
-    if (close === -1) return null;
-    const inner = pending.slice(1, close);
-    if (/[<>\n]/.test(inner) || /\\(?![>\\])/.test(inner.replace(/\\>/g, ''))) {
-      // angle destination may not contain unescaped < or newline
+  if (!skipWs()) return null;
+  let href;
+  {
+    const line = lines[li];
+    if (line[col] === '<') {
+      const close = line.indexOf('>', col + 1);
+      if (close === -1) return null;
+      const inner = line.slice(col + 1, close);
       if (inner.includes('<')) return null;
-    }
-    href = inner;
-    pending = pending.slice(close + 1);
-  } else {
-    // Bare destination: scan with paren balance.
-    let depth = 0;
-    let j = 0;
-    while (j < pending.length) {
-      const ch = pending[j];
-      if (ch === '\\') { j += 2; continue; }
-      if (ch === ' ' || ch === '\t') break;
-      if (ch === '(') depth++;
-      if (ch === ')') { depth--; if (depth < 0) return null; }
-      j++;
-    }
-    if (depth !== 0 && j >= pending.length) {
-      // Unbalanced and ran out of line: not a def.
+      href = inner;
+      col = close + 1;
+    } else {
+      let depth = 0;
+      let j = col;
+      while (j < line.length) {
+        const ch = line[j];
+        if (ch === '\\') { j += 2; continue; }
+        if (ch === ' ' || ch === '\t') break;
+        if (ch === '(') depth++;
+        if (ch === ')') { depth--; if (depth < 0) return null; }
+        j++;
+      }
       if (depth !== 0) return null;
+      href = line.slice(col, j);
+      if (href.length === 0) return null;
+      col = j;
     }
-    href = pending.slice(0, j);
-    if (href.length === 0) return null;
-    pending = pending.slice(j);
   }
-  // Optional title: "..." or '...' or (...), on this line or the next.
-  const beforeTitleLines = usedLines;
-  const savePending = pending;
-  let hasTitle = false;
-  if (skipWsLines()) {
-    const q = pending[0];
-    if (q === '"' || q === "'" || q === '(') {
-      const closer = q === '(' ? ')' : q;
-      let j = q === '(' ? 1 : 1;
-      let ok = false;
-      let t = '';
-      while (j < pending.length) {
-        const ch = pending[j];
-        if (ch === '\\') { t += ch + (pending[j + 1] || ''); j += 2; continue; }
-        if (ch === closer) { ok = true; break; }
+  const destLine = li;
+  // Scan a title starting at (tli, tcol) where lines[tli][tcol] is a quote.
+  // Returns { title, endLine, endCol } or null.
+  const scanTitle = (tli, tcol) => {
+    const q = lines[tli][tcol];
+    if (q !== '"' && q !== "'" && q !== '(') return null;
+    const closer = q === '(' ? ')' : q;
+    let t = '';
+    let cli = tli;
+    let ccol = tcol + 1;
+    while (cli < lines.length && cli - i <= 20) {
+      const line = lines[cli];
+      let j = ccol;
+      let done = false;
+      while (j < line.length) {
+        const ch = line[j];
+        if (ch === '\\') { t += ch + (line[j + 1] ?? ''); j += 2; continue; }
+        if (ch === closer) { done = true; break; }
         if (q === '(' && ch === '(') return null;
-        t += ch; j++;
+        t += ch;
+        j++;
       }
-      if (ok) {
-        title = t;
-        hasTitle = true;
-        pending = pending.slice(j + 1);
+      if (done) return { title: t, endLine: cli, endCol: j + 1 };
+      t += '\n';
+      cli++;
+      ccol = 0;
+      if (cli < lines.length && RE_BLANK.test(lines[cli])) return null;
+    }
+    return null;
+  };
+  let title = null;
+  let endLine = destLine;
+  const rest = lines[destLine].slice(col);
+  if (/^[ \t]*$/.test(rest)) {
+    // Title may live on the following line(s); failure there is harmless.
+    const nl = destLine + 1;
+    if (nl < lines.length && !RE_BLANK.test(lines[nl])) {
+      const indentM = /^ {0,3}/.exec(lines[nl]);
+      const tcol = indentM[0].length;
+      const tq = lines[nl][tcol];
+      if (tq === '"' || tq === "'" || tq === '(') {
+        const st = scanTitle(nl, tcol);
+        if (st && /^[ \t]*$/.test(lines[st.endLine].slice(st.endCol))) {
+          title = st.title;
+          endLine = st.endLine;
+        }
       }
     }
+  } else if (/^[ \t]/.test(rest)) {
+    // Same-line title: mandatory clean ending.
+    const tcol = col + (rest.length - rest.replace(/^[ \t]+/, '').length);
+    const st = scanTitle(destLine, tcol);
+    if (!st) return null;
+    if (!/^[ \t]*$/.test(lines[st.endLine].slice(st.endCol))) return null;
+    title = st.title;
+    endLine = st.endLine;
+  } else {
+    // Text glued to the destination: not a definition.
+    return null;
   }
-  if (!hasTitle) {
-    usedLines = beforeTitleLines;
-    pending = savePending;
-  }
-  // After destination/title, the rest of the final line must be blank.
-  if (!/^[ \t]*$/.test(pending)) return null;
-  return { lines: usedLines + 1, label, href: unescapeString(href), title: title === null ? null : unescapeString(title) };
+  return {
+    lines: endLine - i + 1,
+    label,
+    href: unescapeString(href),
+    title: title === null ? null : unescapeString(title),
+  };
 }
 
 const TAGLIKE = '<\\/?[A-Za-z][A-Za-z0-9-]*(?:[ \\t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \\t]*=[ \\t]*(?:[^ \\t"\'=<`]+|\'[^\']*\'|"[^"]*"))?)*[ \\t]*\\/?>';
@@ -506,18 +529,61 @@ function isDelimiterRow(line) {
   return align;
 }
 
+// Strip up to `indent` columns of leading whitespace (never fails):
+// used for lazy continuation lines, which keep whatever indentation is
+// left after removing as much as the container would.
+function stripUpTo(line, indent, baseCol) {
+  baseCol = baseCol || 0;
+  let cols = 0;
+  let i = 0;
+  while (i < line.length && cols < indent) {
+    const ch = line[i];
+    if (ch === ' ') { cols++; i++; }
+    else if (ch === '\t') {
+      const add = 4 - ((baseCol + cols) % 4);
+      if (cols + add <= indent) { cols += add; i++; }
+      else return ' '.repeat(cols + add - indent) + line.slice(i + 1);
+    } else break;
+  }
+  return line.slice(i);
+}
+
+// Whether a block quote's gathered content currently ends inside a
+// paragraph (so a lazy continuation line may follow).
+function quoteTailIsParagraph(inner) {
+  const last = inner[inner.length - 1];
+  if (last === undefined || RE_BLANK.test(last)) return false;
+  if (measureIndent(last, 0, 4, 0).cols >= 4) return false;
+  if (RE_ATX.test(last) || RE_FENCE.test(last) || RE_HR.test(last) ||
+      RE_QUOTE.test(last) || RE_SETEXT.test(last)) return false;
+  if (listMarker(last, 0)) return false;
+  if (htmlBlockStart(last)) return false;
+  return true;
+}
+
 // The block lexer: turns an array of source lines into a token list,
 // registering link reference definitions into state.defs as it goes.
 // `inItem` marks list-item content, where an ordered list with any start
-// number may interrupt the item's paragraph.
-function lexBlocks(lines, state, inItem, baseCol) {
+// number may interrupt the item's paragraph. `meter`, when given,
+// records whether a blank line separated two blocks at this level
+// (which is what makes a list loose).
+function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
   baseCol = baseCol || 0;
   const tokens = [];
   let i = 0;
   const n = lines.length;
+  let blankSeen = false;
   while (i < n) {
     const line = lines[i];
-    if (RE_BLANK.test(line)) { i++; continue; }
+    if (RE_BLANK.test(line)) {
+      if (tokens.length) blankSeen = true;
+      i++;
+      continue;
+    }
+    if (blankSeen) {
+      if (meter) meter.blankBetween = true;
+      blankSeen = false;
+    }
 
     // Fenced code
     let m = RE_FENCE.exec(line);
@@ -606,23 +672,38 @@ function lexBlocks(lines, state, inItem, baseCol) {
           openFence = null;
         }
       };
+      const lazyIdx = new Set();
       while (i < n) {
         const l = lines[i];
         const strippedQ = stripQuoteMarker(l, baseCol);
         if (strippedQ !== null) { inner.push(strippedQ.text); quoteCols = strippedQ.cols; trackFence(strippedQ.text); i++; continue; }
         if (RE_BLANK.test(l)) break;
-        // Laziness: a paragraph continuation line may omit the marker,
-        // but only while no fenced code block is open inside the quote.
-        if (openFence === null && inner.length && !RE_BLANK.test(inner[inner.length - 1]) &&
+        // Laziness: a paragraph continuation line may omit the marker.
+        // It is only possible while the quote's current block is a
+        // paragraph (its last line is paragraph text) and no fenced
+        // code block is open inside the quote.
+        if (openFence === null && inner.length &&
+            quoteTailIsParagraph(inner) &&
             !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_HR.test(l) &&
             !RE_QUOTE.test(l) && !listMarker(l, baseCol) && !htmlInterrupts(htmlBlockStart(l))) {
-          inner.push(l);
+          let lazyLine = l;
+          const ind = measureIndent(l, 0, 5, baseCol);
+          if (ind.cols >= 4) lazyLine = stripIndent(l, 4, false, baseCol) ?? l;
+          if (RE_SETEXT.test(lazyLine)) {
+            // A lazy setext underline after a multi-line paragraph is
+            // kept as paragraph text, indented four columns.
+            let tail = 0;
+            for (let k = inner.length - 1; k >= 0 && !RE_BLANK.test(inner[k]); k--) tail++;
+            if (tail >= 2) lazyLine = '    ' + lazyLine;
+          }
+          lazyIdx.add(inner.length);
+          inner.push(lazyLine);
           i++;
           continue;
         }
         break;
       }
-      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false, baseCol + quoteCols) });
+      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false, baseCol + quoteCols, undefined, lazyIdx) });
       continue;
     }
 
@@ -671,7 +752,12 @@ function lexBlocks(lines, state, inItem, baseCol) {
     let setext = 0;
     while (i < n) {
       const l = lines[i];
-      if (RE_BLANK.test(l)) break;
+      if (RE_BLANK.test(l)) {
+        // A whitespace-only final line still belongs to the paragraph.
+        if (i === n - 1 && chunk.length && l.length > 0) { chunk.push(l); i++; }
+        break;
+      }
+      if (lazySet && lazySet.has(i)) { chunk.push(l); i++; continue; }
       const sm = RE_SETEXT.exec(l);
       if (sm && chunk.length >= 1) { setext = sm[1][0] === '=' ? 1 : 2; i++; break; }
       // Table: second line is a delimiter row.
@@ -702,7 +788,13 @@ function lexBlocks(lines, state, inItem, baseCol) {
       // Extract defs from the chunk first: definitions cannot be part of a
       // heading in practice, but a leading def line stays a def.
       const rest = extractDefs(chunk, state);
-      if (rest.length) tokens.push({ type: 'heading', depth: setext, text: rest.join('\n').trim() });
+      if (rest.length) {
+        tokens.push({ type: 'heading', depth: setext, text: rest.join('\n').trim() });
+      } else {
+        // The chunk was only definitions: the underline line starts a
+        // fresh block instead of making a heading.
+        i = i - 1;
+      }
       continue;
     }
     const rest = extractDefs(chunk, state);
@@ -729,28 +821,21 @@ function interruptsParagraph(l, chunk, inItem, baseCol) {
   return false;
 }
 
-// Peel link reference definitions out of a paragraph chunk (they may appear
-// on any line of the chunk). Registers them in state.defs; the first
-// definition of a label wins. Returns the remaining text lines.
+// Peel link reference definitions off the START of a paragraph chunk
+// (only leading definitions count). Registers them in state.defs; the
+// first definition of a label wins. Returns the remaining text lines.
 function extractDefs(chunk, state) {
-  const out = [];
   let i = 0;
   while (i < chunk.length) {
     const d = tryParseDef(chunk, i);
-    if (d) {
-      const key = normaliseLabel(unescapeString(d.label));
-      if (key && !state.defs.has(key)) {
-        state.defs.set(key, { href: d.href, title: d.title });
-      } else if (key && d.label !== undefined && !state.defs.has(key)) {
-        state.defs.set(key, { href: d.href, title: d.title });
-      }
-      i += d.lines;
-      continue;
+    if (!d) break;
+    const key = normaliseLabel(d.label);
+    if (key && !state.defs.has(key)) {
+      state.defs.set(key, { href: d.href, title: d.title });
     }
-    out.push(chunk[i]);
-    i++;
+    i += d.lines;
   }
-  return out;
+  return chunk.slice(i);
 }
 
 // Lex a whole list starting at lines[start] whose first marker is firstLm.
@@ -797,7 +882,6 @@ function lexList(lines, start, firstLm, state, baseCol) {
         }
         if (stripped !== null) {
           // More content in this item after a blank line.
-          loose = true;
           itemSawBlank = true;
           pendingBlanks = j - i;
           for (let k = 0; k < pendingBlanks; k++) itemLines.push('');
@@ -826,8 +910,8 @@ function lexList(lines, start, firstLm, state, baseCol) {
       const lastLine = itemLines[itemLines.length - 1];
       if (lastLine !== undefined && lastLine !== '' &&
           !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_QUOTE.test(l) &&
-          !htmlInterrupts(htmlBlockStart(l))) {
-        itemLines.push(l);
+          !RE_HR.test(l) && !htmlInterrupts(htmlBlockStart(l))) {
+        itemLines.push(stripUpTo(l, contentIndent, baseCol));
         i++;
         continue;
       }
@@ -837,7 +921,9 @@ function lexList(lines, start, firstLm, state, baseCol) {
     void lastWasBlankRun;
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
-    items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent));
+    const meter = {};
+      items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent, meter));
+      if (meter.blankBetween) loose = true;
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
     const nlm = listMarker(lines[i], baseCol);
@@ -890,10 +976,15 @@ function findClosingBracket(s, pos) {
       continue;
     }
     if (ch === '<') {
-      // A valid HTML tag is skipped whole: brackets inside its attribute
-      // values do not count.
+      // A tag-like span is skipped whole: brackets inside it (including
+      // inside attribute values) do not count.
       const tm = RE_TAG.exec(s.slice(i));
       if (tm) { i += tm[0].length; continue; }
+      const nx = s[i + 1];
+      if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
+        const gt = s.indexOf('>', i + 1);
+        if (gt !== -1) { i = gt + 1; continue; }
+      }
       i++;
       continue;
     }
@@ -1176,16 +1267,20 @@ function parseInline(s, defs, tracker) {
         if (s[after] === '(') {
           const d = parseInlineDest(s, after);
           if (d) { href = d.href; title = d.title; end = d.end; }
-        } else if (s[after] === '[') {
+        }
+        if (end === -1 && s[after] === '[') {
           const close2 = findClosingBracket(s, after + 1);
           if (close2 !== -1) {
             const rawLabel = s.slice(after + 1, close2);
             const label = rawLabel === '' ? linkText : rawLabel;
-            const def = defs.get(normaliseLabel(label.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, '$1')));
+            const def = defs.get(normaliseLabel(label));
             if (def) { href = def.href; title = def.title; end = close2 + 1; }
           }
-        } else if (!isImage || true) {
-          const def = defs.get(normaliseLabel(linkText.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, '$1')));
+        }
+        if (end === -1 && s[after] !== '[') {
+          // Shortcut reference (also the fallback when an inline
+          // destination fails to parse).
+          const def = defs.get(normaliseLabel(linkText));
           if (def) { href = def.href; title = def.title; end = after; }
         }
         if (end !== -1) {
