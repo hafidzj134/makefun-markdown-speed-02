@@ -1390,11 +1390,32 @@ function trimAutolink(text) {
   return t;
 }
 
+// Scan a parenthesised region starting at s[pos] === '(' and return the
+// index just past its matching ')' (backslash escapes are skipped), or
+// -1 when the region never closes.
+function scanParenRegion(s, pos) {
+  let depth = 0;
+  let j = pos;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) return j + 1;
+    }
+    j++;
+  }
+  return -1;
+}
+
 // Parse inline markup in `s` into HTML. `defs` is the definition map.
 // Links may not contain links: `tracker`, when given, records whether a
 // link was formed, so a caller parsing candidate link text can reject the
-// outer link when an inner one won.
-function parseInline(s, ctx, tracker, inLink) {
+// outer link when an inner one won. With `suppressEm` set (the region of
+// a failed inline link), emphasis and strikethrough never form, though
+// code spans, links and autolinks inside still do.
+function parseInline(s, ctx, tracker, inLink, suppressEm) {
   const defs = ctx.defs;
   const nodes = [];
   let text = '';
@@ -1526,6 +1547,19 @@ function parseInline(s, ctx, tracker, inLink) {
           const def = defs.get(normaliseLabel(linkText));
           if (def) { href = def.href; title = def.title; end = after; }
         }
+        if (end === -1 && s[after] === '(' && !suppressEm) {
+          // A bracketed span followed by a parenthesised destination
+          // that fails to parse: the whole region renders literally,
+          // with emphasis suppressed inside it.
+          const regionEnd = scanParenRegion(s, after);
+          if (regionEnd !== -1) {
+            flushText();
+            const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
+            nodes.push({ t: 'html', s: html });
+            i = regionEnd;
+            continue;
+          }
+        }
         if (end !== -1) {
           if (isImage) {
             flushText();
@@ -1557,6 +1591,7 @@ function parseInline(s, ctx, tracker, inLink) {
     if (ch === '*' || ch === '_' || ch === '~') {
       let run = 0;
       while (s[i] === ch) { run++; i++; }
+      if (suppressEm) { text += ch.repeat(run); continue; }
       flushText();
       nodes.push({ t: 'delim', ch, len: run, origLen: run, s: s.slice(i - run, i) });
       continue;
@@ -1659,6 +1694,53 @@ function nodeCharAfter(nodes, idx) {
   return null;
 }
 
+// Inspect the content between a candidate opener (index oi) and closer
+// (index ci) for the reference renderer's nesting rejection: a directly
+// nested span of the opposite kind (em inside strong or strong inside
+// em, same delimiter character) whose opener follows whitespace and
+// whose closer is immediately followed by more text. Returns 'poison'
+// when the pairing must be rejected, 'rescue' when it may proceed by
+// absorbing one excess character of the closing run as literal content,
+// and null when the content is clean.
+function poisonState(nodes, oi, ci, tag, ch, closerLen, use) {
+  const opp = tag === 'strong' ? 'em' : 'strong';
+  // Spent delimiter runs (length zero) are invisible for this test.
+  const visible = (nd) => nd !== undefined && !(nd.t === 'delim' && nd.len === 0);
+  const nextIdx = (from) => {
+    for (let k = from; k < ci; k++) if (visible(nodes[k])) return k;
+    return -1;
+  };
+  for (let k = oi + 1; k < ci; k++) {
+    const E = nodes[k];
+    if (E.t !== 'elem' || E.tag !== opp || E.ch !== ch) continue;
+    let prev;
+    for (let p = k - 1; p > oi; p--) if (visible(nodes[p])) { prev = nodes[p]; break; }
+    const preceded = prev !== undefined &&
+      ((prev.t === 'text' && /\s$/.test(prev.s)) || prev.t === 'break');
+    if (!preceded) continue;
+    const ai = nextIdx(k + 1);
+    if (ai === -1) continue; // the nested span ends the content: clean
+    const A = nodes[ai];
+    if (A.t !== 'text') continue;
+    if (/^\s/.test(A.s)) continue; // cleanly separated from what follows
+    const bi = nextIdx(ai + 1);
+    if (bi === -1) {
+      // The attached text runs right up to the closing run: the
+      // pairing survives only when the run has an excess character
+      // to leave behind as a literal.
+      return closerLen > use ? 'rescue' : 'poison';
+    }
+    const B = nodes[bi];
+    if (B.t === 'delim' && B.ch === ch) {
+      if (B.len >= 2) continue; // a longer run absorbs the attachment
+      if (!/\s/.test(A.s)) continue; // a lone delimiter rescues it
+      return 'poison';
+    }
+    return 'poison';
+  }
+  return null;
+}
+
 // CommonMark-style delimiter processing for *, _ and ~~.
 function processEmphasis(nodes) {
   // Compute flanking for delimiter runs.
@@ -1715,10 +1797,25 @@ function processEmphasis(nodes) {
     if (closer.ch === '~') { use = opener.len; tag = 'del'; }
     else if (opener.len >= 2 && closer.len >= 2) { use = 2; tag = 'strong'; }
     else { use = 1; tag = 'em'; }
+    // The reference renderer's recursive matcher rejects an em/strong
+    // span whose content holds a directly nested span of the opposite
+    // kind (same delimiter character) that starts after whitespace and
+    // ends attached to more text — unless the attachment is rescued by
+    // a lone delimiter, absorbed by a longer run, or paid for with one
+    // excess character of the closing run (see poisonState).
+    let absorbStar = false;
+    if (closer.ch !== '~') {
+      const pz = poisonState(nodes, oi, ci, tag, closer.ch, closer.len, use);
+      if (pz === 'poison') { ci++; continue; }
+      if (pz === 'rescue') { absorbStar = true; closer.len -= 1; }
+    }
     opener.len -= use;
     closer.len -= use;
     const inner = nodes.splice(oi + 1, ci - oi - 1);
-    const el = { t: 'elem', tag, children: inner };
+    if (absorbStar) {
+      inner.push({ t: 'delim', ch: closer.ch, len: 1, origLen: 1, s: closer.ch });
+    }
+    const el = { t: 'elem', tag, ch: opener.ch, children: inner };
     nodes.splice(oi + 1, 0, el);
     // Adjust ci: the element now sits at oi+1; closer shifted.
     ci = oi + 2;
