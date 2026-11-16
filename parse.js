@@ -19,6 +19,7 @@
 const ESCAPABLE = '\\!"#$%&\'()*+,-./:;<=>?@[]^_`{|}~';
 
 const UNICODE_PUNCT = /[\p{P}\p{S}]/u;
+// Punctuation for flanking tests: the full Unicode P and S categories.
 function isPunct(ch) {
   const c = ch.charCodeAt(0);
   if (c < 128) {
@@ -26,6 +27,13 @@ function isPunct(ch) {
            (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
   }
   return UNICODE_PUNCT.test(ch);
+}
+
+// Only ASCII punctuation can be backslash-escaped.
+function isAsciiPunct(ch) {
+  const c = ch.charCodeAt(0);
+  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+         (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
 }
 
 function isSpace(ch) {
@@ -764,6 +772,9 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
       const res = lexList(lines, i, lm, state, baseCol);
       tokens.push(res.token);
       i = res.next;
+      // The list may have swallowed a blank run at its end; that blank
+      // still separates the list from the following block.
+      if (res.endBlank && i < n) blankSeen = true;
       continue;
     }
 
@@ -899,6 +910,7 @@ function extractDefs(chunk, state) {
 function lexList(lines, start, firstLm, state, baseCol) {
   baseCol = baseCol || 0;
   const items = [];
+  let endBlank = false;
   let i = start;
   let loose = false;
   const ordered = firstLm.ordered;
@@ -928,7 +940,13 @@ function lexList(lines, start, firstLm, state, baseCol) {
         if (j >= lines.length) { i = j; lastWasBlankRun = true; break; }
         if (RE_HR.test(lines[j])) { i = j; lastWasBlankRun = true; break; }
         // An item with no content yet does not resume after a blank line.
-        if (itemLines.every((x) => x === '')) { i = j; lastWasBlankRun = true; break; }
+        if (itemLines.every((x) => x === '')) {
+          const fLm = listMarker(lines[j], baseCol);
+          if (fLm && fLm.ordered === ordered &&
+              (!ordered ? fLm.bullet === bulletChar : fLm.bullet === delimChar) &&
+              fLm.indentCols < contentIndent) loose = true;
+          i = j; lastWasBlankRun = true; break;
+        }
         const nextLm = listMarker(lines[j], baseCol);
         const stripped = stripIndent(lines[j], contentIndent, true, baseCol);
         if (nextLm && nextLm.ordered === ordered &&
@@ -979,7 +997,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
       break;
     }
     void itemSawBlank;
-    void lastWasBlankRun;
+    endBlank = lastWasBlankRun;
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
     const meter = {};
@@ -996,6 +1014,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
   return {
     token: { type: 'list', ordered, start: ordered ? firstLm.num : 1, loose, items },
     next: i,
+    endBlank,
   };
 }
 
@@ -1254,7 +1273,7 @@ function parseInline(s, defs, tracker) {
         while (s[i] === ' ' || s[i] === '\t') i++;
         continue;
       }
-      if (nx !== undefined && isPunct(nx)) {
+      if (nx !== undefined && isAsciiPunct(nx)) {
         // An escaped character is literal: it must not be reinterpreted
         // (e.g. \& must not become an entity reference start).
         flushText();
