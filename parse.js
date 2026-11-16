@@ -151,14 +151,15 @@ function normaliseLabel(s) {
 // pos is the index just past the consumed indent; a tab that would overshoot
 // `maxCols` is only partially consumed (reported via `partial` = remaining
 // columns of that tab kept as spaces count).
-function measureIndent(line, pos, maxCols) {
+function measureIndent(line, pos, maxCols, baseCol) {
+  baseCol = baseCol || 0;
   let cols = 0;
   let i = pos;
   while (i < line.length && cols < maxCols) {
     const ch = line[i];
     if (ch === ' ') { cols++; i++; }
     else if (ch === '\t') {
-      const add = 4 - (cols % 4);
+      const add = 4 - ((baseCol + cols) % 4);
       if (cols + add <= maxCols) { cols += add; i++; }
       else {
         // Partially consumed tab: caller treats (cols+add-maxCols) spaces
@@ -189,7 +190,8 @@ const RE_QUOTE = /^ {0,3}>[ \t]?/;
 // spaces, the '>', and one optional space; a tab in the marker zone keeps
 // its remaining column width as spaces. Returns null when the line does
 // not start a quote.
-function stripQuoteMarker(line) {
+function stripQuoteMarker(line, baseCol) {
+  baseCol = baseCol || 0;
   let i = 0;
   let cols = 0;
   while (i < line.length && cols < 3 && line[i] === ' ') { i++; cols++; }
@@ -197,9 +199,9 @@ function stripQuoteMarker(line) {
   i++; cols++;
   if (line[i] === ' ') { i++; cols++; }
   if (line[i] === '\t') {
-    return ' '.repeat(4 - (cols % 4)) + line.slice(i + 1);
+    return { text: ' '.repeat(4 - ((baseCol + cols) % 4)) + line.slice(i + 1), cols };
   }
-  return line.slice(i);
+  return { text: line.slice(i), cols };
 }
 const RE_DEF_START = /^ {0,3}\[/;
 
@@ -330,6 +332,7 @@ function tryParseDef(lines, i) {
 
 const TAGLIKE = '<\\/?[A-Za-z][A-Za-z0-9-]*(?:[ \\t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \\t]*=[ \\t]*(?:[^ \\t"\'=<`]+|\'[^\']*\'|"[^"]*"))?)*[ \\t]*\\/?>';
 const RE_TAGLINE = new RegExp('^(?:' + TAGLIKE + '[ \\t]*)+$');
+const RE_SINGLE_TAG = new RegExp('^' + TAGLIKE + '$');
 
 // Detect the start of an HTML block on a line. Returns
 // { kind, blockTag, closing } where kind is 'comment' | 'pi' | 'decl' |
@@ -357,8 +360,8 @@ function htmlBlockStart(line) {
     if (afterOk) return { kind: 'block', blockTag: true, closing };
     return null;
   }
-  // Any other complete tag: only when the whole line is tags + whitespace.
-  if (RE_TAGLINE.test(s.trim())) return { kind: 'tagline', blockTag: false, closing };
+  // A line consisting of exactly one complete tag is also a block.
+  if (RE_SINGLE_TAG.test(s.trim())) return { kind: 'tagline', blockTag: false, closing };
   return null;
 }
 
@@ -375,12 +378,13 @@ function htmlInterrupts(hb) {
 // the current container level is NOT assumed; line is raw).
 // Returns { bullet: char|null, num: number|null, markerEnd, contentIndent }
 // measured in columns from line start, or null.
-function listMarker(line) {
+function listMarker(line, baseCol) {
+  baseCol = baseCol || 0;
   let i = 0;
   let cols = 0;
   while (i < line.length && cols < 4) {
     if (line[i] === ' ') { cols++; i++; }
-    else if (line[i] === '\t') { cols += 4 - (cols % 4); i++; }
+    else if (line[i] === '\t') { cols += 4 - ((baseCol + cols) % 4); i++; }
     else break;
   }
   if (cols > 3) return null;
@@ -409,7 +413,7 @@ function listMarker(line) {
   let firstWsEnd = -1;
   while (j < line.length && (line[j] === ' ' || line[j] === '\t')) {
     if (line[j] === ' ') wcols += 1;
-    else wcols += 4 - ((indentCols + markerLen + wcols) % 4);
+    else wcols += 4 - ((baseCol + indentCols + markerLen + wcols) % 4);
     j++;
     if (firstWsEnd === -1) firstWsEnd = j;
     if (wcols > 4) break;
@@ -432,14 +436,18 @@ function listMarker(line) {
 // Strip `indent` columns from the start of a line; returns the remaining
 // text, or null when the line has fewer columns of indentation (and is not
 // blank). Partially-consumed tabs leave spaces behind.
-function stripIndent(line, indent, expandTab) {
+// Strip `indent` columns from a line. `baseCol` is the absolute column
+// the line starts at in the original source (container strips accumulate
+// it), so tab widths are computed against true source columns.
+function stripIndent(line, indent, expandTab, baseCol) {
+  baseCol = baseCol || 0;
   let cols = 0;
   let i = 0;
   while (i < line.length && cols < indent) {
     const ch = line[i];
     if (ch === ' ') { cols++; i++; }
     else if (ch === '\t') {
-      const add = 4 - (cols % 4);
+      const add = 4 - ((baseCol + cols) % 4);
       if (cols + add <= indent) { cols += add; i++; }
       else return ' '.repeat(cols + add - indent) + line.slice(i + 1);
     } else break;
@@ -451,7 +459,7 @@ function stripIndent(line, indent, expandTab) {
   // the strip boundary keeps the width it had at its original column,
   // as spaces.
   if (expandTab && indent > 0 && line[i] === '\t') {
-    return ' '.repeat(4 - (cols % 4)) + line.slice(i + 1);
+    return ' '.repeat(4 - ((baseCol + cols) % 4)) + line.slice(i + 1);
   }
   return line.slice(i);
 }
@@ -502,7 +510,8 @@ function isDelimiterRow(line) {
 // registering link reference definitions into state.defs as it goes.
 // `inItem` marks list-item content, where an ordered list with any start
 // number may interrupt the item's paragraph.
-function lexBlocks(lines, state, inItem) {
+function lexBlocks(lines, state, inItem, baseCol) {
+  baseCol = baseCol || 0;
   const tokens = [];
   let i = 0;
   const n = lines.length;
@@ -525,7 +534,7 @@ function lexBlocks(lines, state, inItem) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripIndent(cl, Math.min(indent, 3)) ?? cl);
+          body.push(stripIndent(cl, Math.min(indent, 3), false, baseCol) ?? cl);
           i++;
         }
         void closed;
@@ -585,6 +594,7 @@ function lexBlocks(lines, state, inItem) {
     // Block quote
     if (RE_QUOTE.test(line)) {
       const inner = [];
+      let quoteCols = 2;
       let openFence = null;
       const trackFence = (txt) => {
         const fm = RE_FENCE.exec(txt);
@@ -598,28 +608,28 @@ function lexBlocks(lines, state, inItem) {
       };
       while (i < n) {
         const l = lines[i];
-        const strippedQ = stripQuoteMarker(l);
-        if (strippedQ !== null) { inner.push(strippedQ); trackFence(strippedQ); i++; continue; }
+        const strippedQ = stripQuoteMarker(l, baseCol);
+        if (strippedQ !== null) { inner.push(strippedQ.text); quoteCols = strippedQ.cols; trackFence(strippedQ.text); i++; continue; }
         if (RE_BLANK.test(l)) break;
         // Laziness: a paragraph continuation line may omit the marker,
         // but only while no fenced code block is open inside the quote.
         if (openFence === null && inner.length && !RE_BLANK.test(inner[inner.length - 1]) &&
             !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_HR.test(l) &&
-            !RE_QUOTE.test(l) && !listMarker(l) && !htmlInterrupts(htmlBlockStart(l))) {
+            !RE_QUOTE.test(l) && !listMarker(l, baseCol) && !htmlInterrupts(htmlBlockStart(l))) {
           inner.push(l);
           i++;
           continue;
         }
         break;
       }
-      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false) });
+      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false, baseCol + quoteCols) });
       continue;
     }
 
     // List
-    const lm = listMarker(line);
+    const lm = listMarker(line, baseCol);
     if (lm) {
-      const res = lexList(lines, i, lm, state);
+      const res = lexList(lines, i, lm, state, baseCol);
       tokens.push(res.token);
       i = res.next;
       continue;
@@ -627,7 +637,7 @@ function lexBlocks(lines, state, inItem) {
 
     // Indented code (cannot interrupt a paragraph; we are at a block start)
     {
-      const ind = measureIndent(line, 0, 4);
+      const ind = measureIndent(line, 0, 4, baseCol);
       if (ind.cols >= 4) {
         const body = [];
         while (i < n) {
@@ -637,14 +647,14 @@ function lexBlocks(lines, state, inItem) {
             // later indented line follows.
             let j = i;
             while (j < n && RE_BLANK.test(lines[j])) j++;
-            if (j < n && measureIndent(lines[j], 0, 4).cols >= 4) {
+            if (j < n && measureIndent(lines[j], 0, 4, baseCol).cols >= 4) {
               for (let k = i; k < j; k++) body.push('');
               i = j;
               continue;
             }
             break;
           }
-          const stripped = stripIndent(l, 4);
+          const stripped = stripIndent(l, 4, false, baseCol);
           if (stripped === null) break;
           body.push(stripped);
           i++;
@@ -683,7 +693,7 @@ function lexBlocks(lines, state, inItem) {
           }
         }
       }
-      if (interruptsParagraph(l, chunk, inItem)) break;
+      if (interruptsParagraph(l, chunk, inItem, baseCol)) break;
       chunk.push(l);
       i++;
     }
@@ -702,13 +712,13 @@ function lexBlocks(lines, state, inItem) {
 }
 
 // Lines that end an open paragraph (when they appear after its first line).
-function interruptsParagraph(l, chunk, inItem) {
+function interruptsParagraph(l, chunk, inItem, baseCol) {
   if (RE_ATX.test(l)) return true;
   const f = RE_FENCE.exec(l);
   if (f && !(f[1][0] === '`' && f[2].includes('`'))) return true;
   if (RE_QUOTE.test(l)) return true;
   if (RE_HR.test(l)) return true;
-  const lm = listMarker(l);
+  const lm = listMarker(l, baseCol);
   if (lm) {
     if (!lm.ordered) return true;
     if (lm.num === 1 || inItem) return true;
@@ -745,7 +755,8 @@ function extractDefs(chunk, state) {
 
 // Lex a whole list starting at lines[start] whose first marker is firstLm.
 // Returns { token, next }.
-function lexList(lines, start, firstLm, state) {
+function lexList(lines, start, firstLm, state, baseCol) {
+  baseCol = baseCol || 0;
   const items = [];
   let i = start;
   let loose = false;
@@ -753,7 +764,7 @@ function lexList(lines, start, firstLm, state) {
   const bulletChar = ordered ? null : firstLm.bullet;
   const delimChar = ordered ? firstLm.bullet : null;
   while (i < lines.length) {
-    const lm = i === start ? firstLm : listMarker(lines[i]);
+    const lm = i === start ? firstLm : listMarker(lines[i], baseCol);
     if (!lm) break;
     if (lm.ordered !== ordered) break;
     if (!ordered && lm.bullet !== bulletChar) break;
@@ -773,8 +784,8 @@ function lexList(lines, start, firstLm, state) {
         let j = i;
         while (j < lines.length && RE_BLANK.test(lines[j])) j++;
         if (j >= lines.length) { i = j; lastWasBlankRun = true; break; }
-        const nextLm = listMarker(lines[j]);
-        const stripped = stripIndent(lines[j], contentIndent, true);
+        const nextLm = listMarker(lines[j], baseCol);
+        const stripped = stripIndent(lines[j], contentIndent, true, baseCol);
         if (nextLm && nextLm.ordered === ordered &&
             (!ordered ? nextLm.bullet === bulletChar : nextLm.bullet === delimChar) &&
             nextLm.indentCols < contentIndent) {
@@ -798,14 +809,14 @@ function lexList(lines, start, firstLm, state) {
         lastWasBlankRun = true;
         break;
       }
-      const stripped = stripIndent(l, contentIndent, true);
+      const stripped = stripIndent(l, contentIndent, true, baseCol);
       if (stripped !== null) {
         itemLines.push(stripped);
         i++;
         continue;
       }
       // A new item at this level?
-      const nlm = listMarker(l);
+      const nlm = listMarker(l, baseCol);
       if (nlm && nlm.indentCols < contentIndent) break;
       // Thematic break ends the list (unless it is a setext underline for
       // the item paragraph, handled by the recursive lexer only when the
@@ -826,10 +837,10 @@ function lexList(lines, start, firstLm, state) {
     void lastWasBlankRun;
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
-    items.push(lexBlocks(itemLines, state, true));
+    items.push(lexBlocks(itemLines, state, true, baseCol + contentIndent));
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
-    const nlm = listMarker(lines[i]);
+    const nlm = listMarker(lines[i], baseCol);
     if (!nlm || nlm.ordered !== ordered) break;
     if (!ordered && nlm.bullet !== bulletChar) break;
     if (ordered && nlm.bullet !== delimChar) break;
@@ -850,7 +861,7 @@ const RE_EMAIL_LINK = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-
 const RE_TAG = new RegExp(
   '^(?:<' + TAG_NAME + '(?:[ \\t\\n]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \\t\\n]*=[ \\t\\n]*(?:[^ \\t\\n"\'=<`]+|\'[^\']*\'|"[^"]*"))?)*[ \\t\\n]*\\/?>' +
   '|</' + TAG_NAME + '[ \\t\\n]*>' +
-  '|<!--(?:[^-]|-(?!->))*-->' +
+  '|<!-->|<!--->|<!--(?:[^-]|-(?!->))*-->' +
   '|<\\?[\\s\\S]*?\\?>' +
   '|<!' + '[A-Za-z]+' + '[\\s\\S]*?>' +
   '|<\\!\\[CDATA\\[[\\s\\S]*?\\]\\]>)');
@@ -964,26 +975,65 @@ function parseInlineDest(s, pos) {
   return { href: unescapeString(href), title: title === null ? null : unescapeString(title), end: i + 1 };
 }
 
+const RE_EMAIL_CORE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+/;
+
+// Match an e-mail core at s[i..]; returns the address or null. A match is
+// rejected when the character right after it could extend the domain
+// (letter/digit would have been consumed; '-' or '_' invalidate it).
+function matchEmailCore(s, i) {
+  const m = RE_EMAIL_CORE.exec(s.slice(i));
+  if (!m) return null;
+  const addr = m[0];
+  const local = addr.slice(0, addr.indexOf('@'));
+  if (local.startsWith('.') || local.endsWith('.')) return null;
+  const next = s[i + addr.length];
+  if (next !== undefined && /[A-Za-z0-9_-]/.test(next)) return null;
+  return addr;
+}
+
 // Extended autolinks in running text (GFM): www., http://, https://,
-// ftp:// and bare e-mail addresses.
+// ftp://, bare e-mail addresses, and mailto:/xmpp: prefixed addresses.
 function matchExtendedAutolink(s, i) {
-  const rest = s.slice(i, i + 8).toLowerCase();
+  const head = s.slice(i, i + 8).toLowerCase();
+  // mailto:address — the prefix is part of the link text.
+  if (head.startsWith('mailto:')) {
+    const addr = matchEmailCore(s, i + 7);
+    if (addr) {
+      const text = s.slice(i, i + 7) + addr;
+      return { text, href: 'mailto:' + addr, end: i + text.length };
+    }
+    return null;
+  }
+  // xmpp:address[/segment] — one optional single-segment path.
+  if (head.startsWith('xmpp:')) {
+    const addr = matchEmailCore(s, i + 5);
+    if (addr) {
+      let text = s.slice(i, i + 5) + addr;
+      let end = i + text.length;
+      if (s[end] === '/') {
+        let j = end + 1;
+        while (j < s.length && !isSpace(s[j]) && s[j] !== '<' && s[j] !== '/') j++;
+        if (j > end + 1) {
+          text += trimAutolink(s.slice(end, j));
+          end = i + text.length;
+        }
+      }
+      return { text, href: text, end };
+    }
+    return null;
+  }
   let protocol = null;
-  if (rest.startsWith('www.')) protocol = 'www';
-  else if (rest.startsWith('http://')) protocol = 'http';
-  else if (rest.startsWith('https://')) protocol = 'https';
-  else if (rest.startsWith('ftp://')) protocol = 'ftp';
+  if (head.startsWith('www.')) protocol = 'www';
+  else if (head.startsWith('http://')) protocol = 'http';
+  else if (head.startsWith('https://')) protocol = 'https';
+  else if (head.startsWith('ftp://')) protocol = 'ftp';
   if (protocol) {
     let j = i;
     while (j < s.length && !isSpace(s[j]) && s[j] !== '<') j++;
     let text = s.slice(i, j);
-    // Trim trailing punctuation that is not part of the URL.
     text = trimAutolink(text);
     if (text.length <= (protocol === 'www' ? 4 : protocol.length + 3)) return null;
     if (protocol === 'www') {
-      // www. must be followed by a valid domain (contains a dot segment).
-      const host = text.slice(4).split(/[/?#]/)[0];
-      if (!host.includes('.')) return null;
       return { text, href: 'http://' + text, end: i + text.length };
     }
     return { text, href: text, end: i + text.length };
@@ -993,31 +1043,38 @@ function matchExtendedAutolink(s, i) {
 
 function trimAutolink(text) {
   let t = text;
+  // Parentheses must balance: cut at the first ')' that unbalances the
+  // text, or before the first '(' that is never closed.
+  {
+    let depth = 0;
+    const opens = [];
+    let cut = -1;
+    for (let k = 0; k < t.length; k++) {
+      if (t[k] === '(') { depth++; opens.push(k); }
+      else if (t[k] === ')') {
+        if (depth === 0) { cut = k; break; }
+        depth--;
+        opens.pop();
+      }
+    }
+    if (cut === -1 && opens.length) cut = opens[0];
+    if (cut !== -1) t = t.slice(0, cut);
+  }
   while (t.length) {
     const last = t[t.length - 1];
     if ('?!.,:*_~'.includes(last)) { t = t.slice(0, -1); continue; }
     if (last === ';') {
-      const ent = /&[A-Za-z][A-Za-z0-9]*;$/.exec(t);
-      if (ent) { t = t.slice(0, -1); continue; }
+      // A trailing named-entity lookalike leaves the link entirely;
+      // a numeric one only loses its semicolon.
+      const named = /&[A-Za-z][A-Za-z0-9]*;$/.exec(t);
+      if (named) { t = t.slice(0, t.length - named[0].length); continue; }
       t = t.slice(0, -1);
       continue;
-    }
-    if (last === ')') {
-      const opens = (t.match(/\(/g) || []).length;
-      const closes = (t.match(/\)/g) || []).length;
-      if (closes > opens) { t = t.slice(0, -1); continue; }
-    }
-    if (last === ']') {
-      const opens = (t.match(/\[/g) || []).length;
-      const closes = (t.match(/\]/g) || []).length;
-      if (closes > opens) { t = t.slice(0, -1); continue; }
     }
     break;
   }
   return t;
 }
-
-const RE_EMAIL_TEXT = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
 
 // Parse inline markup in `s` into HTML. `defs` is the definition map.
 // Links may not contain links: `tracker`, when given, records whether a
@@ -1167,7 +1224,8 @@ function parseInline(s, defs, tracker) {
       continue;
     }
     // Extended autolinks starting inside running text.
-    if ((ch === 'w' || ch === 'h' || ch === 'f') &&
+    const chLow = (ch >= 'A' && ch <= 'Z') ? ch.toLowerCase() : ch;
+    if ((chLow === 'w' || chLow === 'h' || chLow === 'f' || chLow === 'm' || chLow === 'x') &&
         (i === 0 || !/[A-Za-z0-9]/.test(s[i - 1]))) {
       const auto = matchExtendedAutolink(s, i);
       if (auto) {
@@ -1179,17 +1237,12 @@ function parseInline(s, defs, tracker) {
     }
     if ((ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') &&
         (i === 0 || !/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i - 1]))) {
-      const em = RE_EMAIL_TEXT.exec(s.slice(i));
-      if (em && em[0].includes('@')) {
-        // Only when the local part is followed by a plausible domain and
-        // the match does not swallow trailing punctuation.
-        let addr = em[0].replace(/\.+$/, '');
-        if (addr.includes('@') && /\.[A-Za-z]{2,}$/.test(addr)) {
-          flushText();
-          nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(addr) + '">' + escapeText(addr) + '</a>' });
-          i += addr.length;
-          continue;
-        }
+      const addr = matchEmailCore(s, i);
+      if (addr) {
+        flushText();
+        nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(addr) + '">' + escapeText(addr) + '</a>' });
+        i += addr.length;
+        continue;
       }
     }
     text += ch;
