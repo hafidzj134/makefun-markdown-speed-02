@@ -613,6 +613,14 @@ function isDelimiterRow(line) {
 // Strip up to `indent` columns of leading whitespace (never fails):
 // used for lazy continuation lines, which keep whatever indentation is
 // left after removing as much as the container would.
+// Strip up to `indent` leading whitespace CHARACTERS (a space or a
+// tab counts as one character) from a fenced-code content line.
+function stripFenceChars(line, indent) {
+  let i = 0;
+  while (i < line.length && i < indent && (line[i] === ' ' || line[i] === '\t')) i++;
+  return line.slice(i);
+}
+
 // Strip up to `indent` columns from a fenced-code content line. When
 // the strip actually consumes part of the leading whitespace run, the
 // rest of the run is materialised as spaces at its original columns;
@@ -724,7 +732,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripUpTo(cl, Math.min(indent, 3), baseCol));
+          body.push(stripFenceChars(cl, Math.min(indent, 3)));
           i++;
         }
         void closed;
@@ -776,7 +784,8 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
                        hb.kind === 'decl' || hb.kind === 'cdata' ||
                        hb.kind === 'rawtag';
       const atFinalEmpty = i === n - 1 && lines[i] === '';
-      const sep = (termKind && i < n && !RE_BLANK.test(lines[i])) || atFinalEmpty ? '\n' : '';
+      // For this test a line of only tabs counts as content, not blank.
+      const sep = (termKind && i < n && !/^ *$/.test(lines[i])) || atFinalEmpty ? '\n' : '';
       tokens.push({ type: 'html', text: body.join('\n'), sep });
       continue;
     }
@@ -1158,19 +1167,27 @@ function findClosingBracket(s, pos) {
     if (ch === '\\') { i += 2; continue; }
     if (ch === '`') {
       // Skip a code span. An unmatched run is literal text and does
-      // not hide the closing bracket.
+      // not hide the closing bracket. A complete span whose content
+      // itself contains a backtick defeats the link entirely.
       let n = 0;
       while (s[i] === '`') { n++; i++; }
       let j = i;
       let closedSpan = false;
+      let closeStart = -1;
       while (j < s.length) {
         if (s[j] === '`') {
           let m = 0;
+          const st = j;
           while (s[j] === '`') { m++; j++; }
-          if (m === n) { closedSpan = true; break; }
+          if (m === n) { closedSpan = true; closeStart = st; break; }
         } else j++;
       }
-      if (closedSpan) { i = j; continue; }
+      if (closedSpan) {
+        // A span whose content contains a backtick is only tolerated
+        // when it sits at the very end of the link text.
+        if (s.slice(i, closeStart).includes('`') && s[j] !== ']') return -1;
+        i = j;
+      }
       continue;
     }
     if (ch === '<') {
@@ -1471,7 +1488,7 @@ function parseInline(s, ctx, tracker, inLink) {
         // A raw <a> tag switches the rest of the document's inline
         // stream into "inside a link" mode (extended autolinks and
         // bare emails stop linking) until a </a> tag appears.
-        if (/^<a[\s/>]/i.test(m[0])) ctx.inLink = true;
+        if (/^<a\s/i.test(m[0])) ctx.inLink = true;
         else if (/^<\/a\s*>/.test(m[0])) ctx.inLink = false;
         i += m[0].length;
         continue;
