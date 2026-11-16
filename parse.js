@@ -34,13 +34,15 @@ function isSpace(ch) {
 const ENTITY_RE = /&(#\d+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/g;
 
 function escapeText(s) {
-  if (!/[&<>]/.test(s)) return s;
+  if (!/[&<>"']/.test(s)) return s;
   let out = '';
   let last = 0;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '<') { out += s.slice(last, i) + '&lt;'; last = i + 1; }
     else if (ch === '>') { out += s.slice(last, i) + '&gt;'; last = i + 1; }
+    else if (ch === '"') { out += s.slice(last, i) + '&quot;'; last = i + 1; }
+    else if (ch === "'") { out += s.slice(last, i) + '&#39;'; last = i + 1; }
     else if (ch === '&') {
       ENTITY_RE.lastIndex = i;
       const m = ENTITY_RE.exec(s);
@@ -69,15 +71,49 @@ function escapeText(s) {
   return out + s.slice(last);
 }
 
-// Escape code content (&, <, >).
+// Escape code content (&, <, > and double quotes).
 function escapeCode(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
-// Escape an attribute value (double-quoted context).
+// Escape an attribute value (double-quoted context): like text escaping,
+// existing entity references are preserved.
 function escapeAttr(s) {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-          .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (!/[&<>"]/.test(s)) return s;
+  let out = '';
+  let last = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '<') { out += s.slice(last, i) + '&lt;'; last = i + 1; }
+    else if (ch === '>') { out += s.slice(last, i) + '&gt;'; last = i + 1; }
+    else if (ch === '"') { out += s.slice(last, i) + '&quot;'; last = i + 1; }
+    else if (ch === '&') {
+      ENTITY_RE.lastIndex = i;
+      const m = ENTITY_RE.exec(s);
+      if (m && m.index === i) {
+        out += s.slice(last, i) + m[0];
+        i += m[0].length - 1;
+        last = i + 1;
+      } else {
+        out += s.slice(last, i) + '&amp;';
+        last = i + 1;
+      }
+    }
+  }
+  return out + s.slice(last);
+}
+
+// Percent-encode a link destination the way the reference renderer does:
+// a full encodeURI pass whose %25 sequences are folded back, so existing
+// escapes survive while spaces, quotes, backslashes and non-ASCII bytes
+// are encoded.
+function cleanHref(href) {
+  try {
+    return encodeURI(href).replace(/%25/g, '%');
+  } catch {
+    return href;
+  }
 }
 
 // Unescape backslash escapes and decode entities in link destinations/titles.
@@ -148,6 +184,23 @@ const RE_FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const RE_HR = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 const RE_SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
 const RE_QUOTE = /^ {0,3}>[ \t]?/;
+
+// Strip a block quote marker from a line, column-aware: up to 3 leading
+// spaces, the '>', and one optional space; a tab in the marker zone keeps
+// its remaining column width as spaces. Returns null when the line does
+// not start a quote.
+function stripQuoteMarker(line) {
+  let i = 0;
+  let cols = 0;
+  while (i < line.length && cols < 3 && line[i] === ' ') { i++; cols++; }
+  if (line[i] !== '>') return null;
+  i++; cols++;
+  if (line[i] === ' ') { i++; cols++; }
+  if (line[i] === '\t') {
+    return ' '.repeat(4 - (cols % 4)) + line.slice(i + 1);
+  }
+  return line.slice(i);
+}
 const RE_DEF_START = /^ {0,3}\[/;
 
 const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul').split(' '));
@@ -379,7 +432,7 @@ function listMarker(line) {
 // Strip `indent` columns from the start of a line; returns the remaining
 // text, or null when the line has fewer columns of indentation (and is not
 // blank). Partially-consumed tabs leave spaces behind.
-function stripIndent(line, indent) {
+function stripIndent(line, indent, expandTab) {
   let cols = 0;
   let i = 0;
   while (i < line.length && cols < indent) {
@@ -394,29 +447,32 @@ function stripIndent(line, indent) {
   if (cols < indent) {
     return RE_BLANK.test(line) ? '' : null;
   }
+  // Container stripping (list items) only: a tab that starts exactly at
+  // the strip boundary keeps the width it had at its original column,
+  // as spaces.
+  if (expandTab && indent > 0 && line[i] === '\t') {
+    return ' '.repeat(4 - (cols % 4)) + line.slice(i + 1);
+  }
   return line.slice(i);
 }
 
-// Split a table row into cells: pipes inside code spans or escaped do not
-// split. Leading/trailing pipe (unescaped, outside code) is dropped.
+// Split a table row into cells on every unescaped pipe (code spans do
+// not protect pipes). Leading/trailing pipes are dropped.
 function splitRow(line) {
   const cells = [];
   let cur = '';
-  let inCode = 0;
   let i = 0;
   const s = line.trim();
   while (i < s.length) {
     const ch = s[i];
-    if (ch === '\\' && i + 1 < s.length) { cur += ch + s[i + 1]; i += 2; continue; }
-    if (ch === '`') {
-      let n = 0;
-      while (s[i] === '`') { n++; i++; }
-      if (inCode === 0) inCode = n;
-      else if (n === inCode) inCode = 0;
-      cur += '`'.repeat(n);
+    if (ch === '\\' && i + 1 < s.length) {
+      // An escaped pipe is cell content, not a separator; it loses its
+      // backslash here (even inside code spans, per the reference).
+      cur += s[i + 1] === '|' ? '|' : ch + s[i + 1];
+      i += 2;
       continue;
     }
-    if (ch === '|' && inCode === 0) { cells.push(cur); cur = ''; i++; continue; }
+    if (ch === '|') { cells.push(cur); cur = ''; i++; continue; }
     cur += ch;
     i++;
   }
@@ -428,7 +484,7 @@ function splitRow(line) {
 }
 
 function isDelimiterRow(line) {
-  if (!line.includes('-')) return null;
+  if (!line.includes('-') || !line.includes('|')) return null;
   const cells = splitRow(line);
   if (cells.length === 0) return null;
   const align = [];
@@ -444,7 +500,9 @@ function isDelimiterRow(line) {
 
 // The block lexer: turns an array of source lines into a token list,
 // registering link reference definitions into state.defs as it goes.
-function lexBlocks(lines, state) {
+// `inItem` marks list-item content, where an ordered list with any start
+// number may interrupt the item's paragraph.
+function lexBlocks(lines, state, inItem) {
   const tokens = [];
   let i = 0;
   const n = lines.length;
@@ -471,6 +529,7 @@ function lexBlocks(lines, state) {
           i++;
         }
         void closed;
+        if (body.length && body[body.length - 1] === '') body.pop();
         tokens.push({ type: 'code', text: body.length ? body.join('\n') + '\n' : '', lang: info.split(/[ \t]/)[0] || '' });
         continue;
       }
@@ -526,13 +585,25 @@ function lexBlocks(lines, state) {
     // Block quote
     if (RE_QUOTE.test(line)) {
       const inner = [];
+      let openFence = null;
+      const trackFence = (txt) => {
+        const fm = RE_FENCE.exec(txt);
+        if (!fm) return;
+        if (openFence === null) {
+          if (!(fm[1][0] === '`' && fm[2].includes('`'))) openFence = fm[1];
+        } else if (fm[1][0] === openFence[0] && fm[1].length >= openFence.length &&
+                   /^[`~]+[ \t]*$/.test(txt.trim())) {
+          openFence = null;
+        }
+      };
       while (i < n) {
         const l = lines[i];
-        const qm = RE_QUOTE.exec(l);
-        if (qm) { inner.push(l.slice(qm[0].length)); i++; continue; }
+        const strippedQ = stripQuoteMarker(l);
+        if (strippedQ !== null) { inner.push(strippedQ); trackFence(strippedQ); i++; continue; }
         if (RE_BLANK.test(l)) break;
-        // Laziness: a paragraph continuation line may omit the marker.
-        if (inner.length && !RE_BLANK.test(inner[inner.length - 1]) &&
+        // Laziness: a paragraph continuation line may omit the marker,
+        // but only while no fenced code block is open inside the quote.
+        if (openFence === null && inner.length && !RE_BLANK.test(inner[inner.length - 1]) &&
             !RE_ATX.test(l) && !RE_FENCE.test(l) && !RE_HR.test(l) &&
             !RE_QUOTE.test(l) && !listMarker(l) && !htmlInterrupts(htmlBlockStart(l))) {
           inner.push(l);
@@ -541,7 +612,7 @@ function lexBlocks(lines, state) {
         }
         break;
       }
-      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state) });
+      tokens.push({ type: 'blockquote', tokens: lexBlocks(inner, state, false) });
       continue;
     }
 
@@ -612,7 +683,7 @@ function lexBlocks(lines, state) {
           }
         }
       }
-      if (interruptsParagraph(l, chunk)) break;
+      if (interruptsParagraph(l, chunk, inItem)) break;
       chunk.push(l);
       i++;
     }
@@ -621,7 +692,7 @@ function lexBlocks(lines, state) {
       // Extract defs from the chunk first: definitions cannot be part of a
       // heading in practice, but a leading def line stays a def.
       const rest = extractDefs(chunk, state);
-      if (rest.length) tokens.push({ type: 'heading', depth: setext, text: rest.join('\n') });
+      if (rest.length) tokens.push({ type: 'heading', depth: setext, text: rest.join('\n').trim() });
       continue;
     }
     const rest = extractDefs(chunk, state);
@@ -631,7 +702,7 @@ function lexBlocks(lines, state) {
 }
 
 // Lines that end an open paragraph (when they appear after its first line).
-function interruptsParagraph(l, chunk) {
+function interruptsParagraph(l, chunk, inItem) {
   if (RE_ATX.test(l)) return true;
   const f = RE_FENCE.exec(l);
   if (f && !(f[1][0] === '`' && f[2].includes('`'))) return true;
@@ -640,7 +711,7 @@ function interruptsParagraph(l, chunk) {
   const lm = listMarker(l);
   if (lm) {
     if (!lm.ordered) return true;
-    if (lm.num === 1) return true;
+    if (lm.num === 1 || inItem) return true;
   }
   const hb = htmlBlockStart(l);
   if (htmlInterrupts(hb)) return true;
@@ -703,7 +774,7 @@ function lexList(lines, start, firstLm, state) {
         while (j < lines.length && RE_BLANK.test(lines[j])) j++;
         if (j >= lines.length) { i = j; lastWasBlankRun = true; break; }
         const nextLm = listMarker(lines[j]);
-        const stripped = stripIndent(lines[j], contentIndent);
+        const stripped = stripIndent(lines[j], contentIndent, true);
         if (nextLm && nextLm.ordered === ordered &&
             (!ordered ? nextLm.bullet === bulletChar : nextLm.bullet === delimChar) &&
             nextLm.indentCols < contentIndent) {
@@ -727,7 +798,7 @@ function lexList(lines, start, firstLm, state) {
         lastWasBlankRun = true;
         break;
       }
-      const stripped = stripIndent(l, contentIndent);
+      const stripped = stripIndent(l, contentIndent, true);
       if (stripped !== null) {
         itemLines.push(stripped);
         i++;
@@ -755,7 +826,7 @@ function lexList(lines, start, firstLm, state) {
     void lastWasBlankRun;
     // Trim trailing blank lines of the item.
     while (itemLines.length && itemLines[itemLines.length - 1] === '') itemLines.pop();
-    items.push(lexBlocks(itemLines, state));
+    items.push(lexBlocks(itemLines, state, true));
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
     const nlm = listMarker(lines[i]);
@@ -805,6 +876,14 @@ function findClosingBracket(s, pos) {
         } else i++;
       }
       if (!closedSpan) return -1;
+      continue;
+    }
+    if (ch === '<') {
+      // A valid HTML tag is skipped whole: brackets inside its attribute
+      // values do not count.
+      const tm = RE_TAG.exec(s.slice(i));
+      if (tm) { i += tm[0].length; continue; }
+      i++;
       continue;
     }
     if (ch === '[') depth++;
@@ -1006,7 +1085,7 @@ function parseInline(s, defs, tracker) {
       if (m) {
         flushText();
         const url = m[1];
-        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(unescapeString(url)) + '">' + escapeText(url) + '</a>' });
+        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(unescapeString(url))) + '">' + escapeText(url) + '</a>' });
         i += m[0].length;
         continue;
       }
@@ -1056,7 +1135,7 @@ function parseInline(s, defs, tracker) {
           if (isImage) {
             flushText();
             const alt = plainText(linkText, defs);
-            let tag = '<img src="' + escapeAttr(href) + '" alt="' + escapeAttr(alt) + '"';
+            let tag = '<img src="' + escapeAttr(cleanHref(href)) + '" alt="' + escapeAttr(alt) + '"';
             if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
             tag += '>';
             nodes.push({ t: 'html', s: tag });
@@ -1067,7 +1146,7 @@ function parseInline(s, defs, tracker) {
           const inner = parseInline(linkText, defs, innerTracker);
           if (!innerTracker.link) {
             flushText();
-            let tag = '<a href="' + escapeAttr(href) + '"';
+            let tag = '<a href="' + escapeAttr(cleanHref(href)) + '"';
             if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
             tag += '>' + inner + '</a>';
             nodes.push({ t: 'html', s: tag });
@@ -1093,7 +1172,7 @@ function parseInline(s, defs, tracker) {
       const auto = matchExtendedAutolink(s, i);
       if (auto) {
         flushText();
-        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(auto.href) + '">' + escapeText(auto.text) + '</a>' });
+        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(auto.href)) + '">' + escapeText(auto.text) + '</a>' });
         i = auto.end;
         continue;
       }
@@ -1128,15 +1207,20 @@ function plainText(s, defs) {
   const html = parseInline(s, defs, undefined);
   return html.replace(/<[^>]*>/g, '')
              .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-             .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+             .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+             .replace(/&amp;/g, '&');
 }
 
+// Neighbour characters for flanking tests: element-like nodes (links,
+// code spans, raw HTML) end/start with punctuation in the source, so they
+// report '!'; hard breaks report a space.
 function nodeCharBefore(nodes, idx) {
   for (let k = idx - 1; k >= 0; k--) {
     const nd = nodes[k];
     if (nd.t === 'text') return nd.s[nd.s.length - 1];
     if (nd.t === 'delim') return nd.ch;
-    return '\n'; // elements behave like punctuation-ish boundaries; use \n sentinel -> treated as 'other'
+    if (nd.t === 'break') return ' ';
+    return '!';
   }
   return null;
 }
@@ -1146,7 +1230,8 @@ function nodeCharAfter(nodes, idx) {
     const nd = nodes[k];
     if (nd.t === 'text') return nd.s[0];
     if (nd.t === 'delim') return nd.ch;
-    return '\n';
+    if (nd.t === 'break') return ' ';
+    return '!';
   }
   return null;
 }
