@@ -613,6 +613,16 @@ function isDelimiterRow(line) {
 // Strip up to `indent` columns of leading whitespace (never fails):
 // used for lazy continuation lines, which keep whatever indentation is
 // left after removing as much as the container would.
+// Strip up to `indent` columns from a fenced-code content line. When
+// the strip actually consumes part of the leading whitespace run, the
+// rest of the run is materialised as spaces at its original columns;
+// with a zero indent the line stays byte-for-byte verbatim.
+function stripFenceLine(line, indent, baseCol) {
+  if (indent <= 0) return line;
+  const r = stripIndent(line, indent, true, baseCol);
+  return r !== null ? r : stripUpTo(line, indent, baseCol);
+}
+
 function stripUpTo(line, indent, baseCol) {
   baseCol = baseCol || 0;
   let cols = 0;
@@ -627,6 +637,23 @@ function stripUpTo(line, indent, baseCol) {
     } else break;
   }
   return line.slice(i);
+}
+
+// Whether a list item's gathered lines currently sit inside an
+// unclosed fenced code block (fence content is never a lazy line).
+function itemFenceOpen(itemLines) {
+  let open = null;
+  for (const l of itemLines) {
+    const fm = RE_FENCE.exec(l);
+    if (!fm) continue;
+    if (open === null) {
+      if (!(fm[1][0] === '`' && fm[2].includes('`'))) open = fm[1];
+    } else if (fm[1][0] === open[0] && fm[1].length >= open.length &&
+               fm[2].trim() === '') {
+      open = null;
+    }
+  }
+  return open !== null;
 }
 
 // Whether a line opens a (valid) fenced code block: a backtick fence
@@ -697,7 +724,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripUpTo(cl, Math.min(indent, 3), baseCol));
+          body.push(stripFenceLine(cl, Math.min(indent, 3), baseCol));
           i++;
         }
         void closed;
@@ -982,8 +1009,41 @@ function lexList(lines, start, firstLm, state, baseCol) {
     let itemSawBlank = false;
     let pendingBlanks = 0;
     let lastWasBlankRun = false;
+    // Fence tracking for gathering: once a fence opener is gathered and
+    // its first body line is indented to the item level (or blank), the
+    // whole fence body belongs to the item, whatever its indentation.
+    // If the first body line is not indented, the item ends instead and
+    // the fence stays empty.
+    let fenceMode = null;
+    let pendingFence = null;
+    const noteLine = (txt) => {
+      const fm = RE_FENCE.exec(txt);
+      if (fenceMode) {
+        if (fm && fm[1][0] === fenceMode.ch && fm[1].length >= fenceMode.len &&
+            fm[2].trim() === '') fenceMode = null;
+        return;
+      }
+      if (fm && !(fm[1][0] === '`' && fm[2].includes('`'))) {
+        pendingFence = { ch: fm[1][0], len: fm[1].length };
+      }
+    };
+    noteLine(itemLines[0]);
     while (i < lines.length) {
       const l = lines[i];
+      if (pendingFence && !fenceMode) {
+        if (RE_BLANK.test(l) ||
+            stripIndent(l, contentIndent, true, baseCol) !== null) {
+          fenceMode = pendingFence;
+        }
+        pendingFence = null;
+      }
+      if (fenceMode) {
+        const txt = stripFenceLine(l, contentIndent, baseCol);
+        itemLines.push(txt);
+        noteLine(txt);
+        i++;
+        continue;
+      }
       if (RE_BLANK.test(l)) {
         // Decide whether the list/item continues after the blank run.
         let j = i;
@@ -1025,6 +1085,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
       const stripped = stripIndent(l, contentIndent, true, baseCol);
       if (stripped !== null) {
         itemLines.push(stripped);
+        noteLine(stripped);
         i++;
         continue;
       }
@@ -1035,9 +1096,12 @@ function lexList(lines, start, firstLm, state, baseCol) {
       // the item paragraph, handled by the recursive lexer only when the
       // line was stripped — here it is not, so it ends the list).
       if (RE_HR.test(l) && !itemLines.length) break;
-      // Laziness: paragraph continuation lines may be unindented.
+      // Laziness: paragraph continuation lines may be unindented, but
+      // only while the item's tail is a paragraph (never inside an
+      // open fence or after another block). Lazy lines stay verbatim.
       const lastLine = itemLines[itemLines.length - 1];
       if (lastLine !== undefined && lastLine !== '' &&
+          fenceMode === null && !isFenceLine(lastLine) &&
           !RE_ATX.test(l) && !isFenceLine(l) && !RE_QUOTE.test(l) &&
           !RE_HR.test(l) && !htmlInterrupts(htmlBlockStart(l))) {
         itemLazy.add(itemLines.length);
