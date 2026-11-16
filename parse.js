@@ -163,6 +163,14 @@ function unescapeString(s) {
 // whitespace runs to one space, trim, fold case (unicode-aware enough for
 // the inputs we must handle: use toLowerCase plus ß/ς style folds below).
 function normaliseLabel(s) {
+  if (parseCaches !== null) {
+    const hit = parseCaches.label.get(s);
+    if (hit !== undefined) return hit;
+    const out = s.replace(/[ \t\n\r]+/g, ' ').trim().toLowerCase()
+                 .replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+    parseCaches.label.set(s, out);
+    return out;
+  }
   return s.replace(/[ \t\n\r]+/g, ' ').trim().toLowerCase()
           .replace(/ß/g, 'ss').replace(/ς/g, 'σ');
 }
@@ -445,6 +453,16 @@ function htmlInterrupts(hb) {
 // measured in columns from line start, or null.
 function listMarker(line, baseCol) {
   baseCol = baseCol || 0;
+  if (parseCaches !== null) {
+    const hit = parseCaches.lm.get(line);
+    if (hit !== undefined && hit.bc === baseCol) return hit.res;
+  }
+  const res = listMarkerRaw(line, baseCol);
+  if (parseCaches !== null) parseCaches.lm.set(line, { bc: baseCol, res });
+  return res;
+}
+
+function listMarkerRaw(line, baseCol) {
   let i = 0;
   let cols = 0;
   while (i < line.length && cols < 4) {
@@ -484,7 +502,10 @@ function listMarker(line, baseCol) {
     if (wcols > 4) break;
   }
   const wsEnd = j;
-  const eol = line.slice(afterPos).trim() === '';
+  let eol = true;
+  for (let k = afterPos; k < line.length; k++) {
+    if (line[k] !== ' ' && line[k] !== '\t') { eol = false; break; }
+  }
   if (!eol && wcols === 0) return null;
   let contentIndent;
   let contentPos;
@@ -526,6 +547,7 @@ function itemFirstContent(line, lm, baseCol) {
 // it), so tab widths are computed against true source columns.
 function stripIndent(line, indent, expandTab, baseCol) {
   baseCol = baseCol || 0;
+  if (indent > 0 && line.length > 0 && line[0] !== ' ' && line[0] !== '\t') return null;
   let cols = 0;
   let i = 0;
   let partial = '';
@@ -797,7 +819,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
       let quoteCols = 2;
       let openFence = null;
       const trackFence = (txt) => {
-        const fm = RE_FENCE.exec(txt);
+        const fm = quickFence(txt);
         if (!fm) return;
         if (openFence === null) {
           if (!(fm[1][0] === '`' && fm[2].includes('`'))) openFence = fm[1];
@@ -817,9 +839,8 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         // paragraph (its last line is paragraph text) and no fenced
         // code block is open inside the quote.
         if (openFence === null && inner.length &&
-            quoteTailIsParagraph(inner) &&
-            !RE_ATX.test(l) && !isFenceLine(l) && !RE_HR.test(l) &&
-            !RE_QUOTE.test(l) && !listMarker(l, baseCol) && !htmlInterrupts(htmlBlockStart(l))) {
+            !startsBlock(l, baseCol) &&
+            quoteTailIsParagraph(inner)) {
           let lazyLine = l;
           const ind = measureIndent(l, 0, 5, baseCol);
           if (ind.cols >= 4) lazyLine = stripIndent(l, 4, false, baseCol) ?? l;
@@ -901,7 +922,8 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         l = stripIndent(l, 4, false, baseCol) ?? l;
       }
       if (lazySet && lazySet.has(i)) { chunk.push(l); i++; continue; }
-      const sm = RE_SETEXT.exec(l);
+      const lead = blockLead(l);
+      const sm = (lead === '=' || lead === '-') ? RE_SETEXT.exec(l) : null;
       if (sm && chunk.length >= 1) { setext = sm[1][0] === '=' ? 1 : 2; i++; break; }
       // Table: second line is a delimiter row.
       if (chunk.length === 1) {
@@ -920,9 +942,11 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
                 break;
               }
               // A body row ends at a line that starts another block.
-              if (RE_QUOTE.test(rl) || isFenceLine(rl) || RE_ATX.test(rl) ||
-                  RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl) ||
-                  measureIndent(rl, 0, 4, baseCol).cols >= 4) break;
+              const rLead = blockLead(rl);
+              if (rLead === null) break; // indented four or more columns
+              if (leadMayStartBlock(rLead) &&
+                  (RE_QUOTE.test(rl) || isFenceLine(rl) || RE_ATX.test(rl) ||
+                   RE_HR.test(rl) || listMarker(rl, baseCol) || htmlBlockStart(rl))) break;
               rows.push(splitRow(rl));
               i++;
             }
@@ -956,10 +980,57 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
   return tokens;
 }
 
+// The first character of a line after at most three columns of
+// indentation, or null when the line is blank or indented by four or
+// more columns (such lines start no block). Block-start tests only
+// ever fire for a handful of leading characters, so this cheap gate
+// lets plain prose lines skip the full battery of checks.
+function blockLead(l) {
+  let p = 0;
+  while (p < 3 && l[p] === ' ') p++;
+  const c = l[p];
+  if (c === undefined || c === ' ' || c === '\t') return null;
+  return c;
+}
+
+const BLOCK_LEADS = '#`~>-+*_<';
+
+function leadMayStartBlock(lead) {
+  return lead !== null &&
+    (BLOCK_LEADS.includes(lead) || (lead >= '0' && lead <= '9'));
+}
+
+// Whether the line starts some block (the test battery used for
+// blockquote laziness), with the lead-character gate applied.
+function startsBlock(l, baseCol) {
+  if (!leadMayStartBlock(blockLead(l))) return false;
+  if (RE_ATX.test(l)) return true;
+  if (isFenceLine(l)) return true;
+  if (RE_HR.test(l)) return true;
+  if (RE_QUOTE.test(l)) return true;
+  if (listMarker(l, baseCol)) return true;
+  if (htmlInterrupts(htmlBlockStart(l))) return true;
+  return false;
+}
+
+// A fence-line check that only pays for the regex when the line can
+// possibly be a fence. Returns the same groups the callers use.
+function quickFence(line) {
+  let i = 0;
+  while (i < 3 && line[i] === ' ') i++;
+  const c = line[i];
+  if (c !== '`' && c !== '~') return null;
+  let j = i;
+  while (line[j] === c) j++;
+  if (j - i < 3) return null;
+  return [null, line.slice(i, j), line.slice(j)];
+}
+
 // Lines that end an open paragraph (when they appear after its first line).
 function interruptsParagraph(l, chunk, inItem, baseCol) {
+  if (!leadMayStartBlock(blockLead(l))) return false;
   if (RE_ATX.test(l)) return true;
-  const f = RE_FENCE.exec(l);
+  const f = quickFence(l);
   if (f && !(f[1][0] === '`' && f[2].includes('`'))) return true;
   if (RE_QUOTE.test(l)) return true;
   if (RE_HR.test(l)) return true;
@@ -1027,7 +1098,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
     let fenceMode = null;
     let pendingFence = null;
     const noteLine = (txt) => {
-      const fm = RE_FENCE.exec(txt);
+      const fm = quickFence(txt);
       if (fenceMode) {
         if (fm && fm[1][0] === fenceMode.ch && fm[1].length >= fenceMode.len &&
             fm[2].trim() === '') fenceMode = null;
@@ -1158,6 +1229,22 @@ const RE_TAG = new RegExp(
   '|<!' + '[A-Za-z]+' + '[\\s\\S]*?>' +
   '|<\\!\\[CDATA\\[[\\s\\S]*?\\]\\]>)');
 
+// Sticky twins of the anchored inline patterns: they match at an
+// exact offset without copying the rest of the string.
+const RE_AUTOLINK_Y = new RegExp(RE_AUTOLINK.source.slice(1), 'y');
+const RE_EMAIL_LINK_Y = new RegExp(RE_EMAIL_LINK.source.slice(1), 'y');
+const RE_TAG_Y = new RegExp(RE_TAG.source.slice(1), 'y');
+
+function execAt(reY, s, i) {
+  reY.lastIndex = i;
+  return reY.exec(s);
+}
+
+// Per-parse memo tables (list markers, normalised labels). They live
+// only for the duration of one parse() call, which stays a pure
+// function of its input.
+let parseCaches = null;
+
 // Find the index of the ']' that closes a bracket opened just before pos,
 // honouring escapes, code spans and nested brackets. Returns -1 if none.
 function findClosingBracket(s, pos, strict) {
@@ -1227,7 +1314,7 @@ function findClosingBracket(s, pos, strict) {
     if (ch === '<') {
       // A tag-like span is skipped whole: brackets inside it (including
       // inside attribute values) do not count.
-      const tm = RE_TAG.exec(s.slice(i));
+      const tm = execAt(RE_TAG_Y, s, i);
       if (tm) { i += tm[0].length; continue; }
       const nx = s[i + 1];
       if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
@@ -1475,7 +1562,7 @@ function scanStrictLabel(s, pos) {
       continue;
     }
     if (c === '<') {
-      const tm = RE_TAG.exec(s.slice(i));
+      const tm = execAt(RE_TAG_Y, s, i);
       if (tm) { i += tm[0].length; continue; }
       const nx = s[i + 1];
       if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
@@ -1500,7 +1587,7 @@ function scanSimpleLabel(s, pos) {
     const c = s[i];
     if (c === '\\') { i += 2; continue; }
     if (c === '<') {
-      const tm = RE_TAG.exec(s.slice(i));
+      const tm = execAt(RE_TAG_Y, s, i);
       if (tm) { i += tm[0].length; continue; }
       const nx = s[i + 1];
       if (nx !== undefined && /[A-Za-z/!?]/.test(nx)) {
@@ -1593,8 +1680,7 @@ function computeCodeMask(s) {
       continue;
     }
     if (c === '<') {
-      const rest = s.slice(i);
-      const tm = RE_TAG.exec(rest) || RE_AUTOLINK.exec(rest) || RE_EMAIL_LINK.exec(rest);
+      const tm = execAt(RE_TAG_Y, s, i) || execAt(RE_AUTOLINK_Y, s, i) || execAt(RE_EMAIL_LINK_Y, s, i);
       if (tm) { i += tm[0].length; continue; }
       i++;
       continue;
@@ -1635,7 +1721,7 @@ function computeCodeMask(s) {
 
 function parseInline(s, ctx, tracker, inLink, suppressEm) {
   const defs = ctx.defs;
-  const codeMask = suppressEm ? null : computeCodeMask(s);
+  const codeMask = suppressEm || !s.includes('`') ? null : computeCodeMask(s);
   const nodes = [];
   let text = '';
   const flushText = () => {
@@ -1706,8 +1792,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
       continue;
     }
     if (ch === '<') {
-      const rest = s.slice(i);
-      let m = RE_AUTOLINK.exec(rest);
+      let m = execAt(RE_AUTOLINK_Y, s, i);
       if (m) {
         flushText();
         const url = m[1];
@@ -1715,7 +1800,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
         i += m[0].length;
         continue;
       }
-      m = RE_EMAIL_LINK.exec(rest);
+      m = execAt(RE_EMAIL_LINK_Y, s, i);
       if (m) {
         flushText();
         const addr = m[1];
@@ -1723,7 +1808,7 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
         i += m[0].length;
         continue;
       }
-      m = RE_TAG.exec(rest);
+      m = execAt(RE_TAG_Y, s, i);
       if (m) {
         flushText();
         nodes.push({ t: 'html', s: m[0] });
@@ -2308,6 +2393,7 @@ export function parse(markdown) {
   const src = markdown.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
   const state = { defs: new Map(), inLink: false };
+  parseCaches = { lm: new Map(), label: new Map() };
   const tokens = lexBlocks(lines, state);
   // Mark html tokens that run to end-of-input (no trailing newline added).
   markEof(tokens, lines);

@@ -8,7 +8,7 @@
 // MAKEFUN_OUTPUT_DIR environment variables override /input and /output so
 // the same driver can be exercised locally.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "./parse.js";
 
@@ -24,5 +24,11 @@ const html = new Array<string>(cases.length);
 for (let k = 0; k < cases.length; k++) {
   html[k] = parse(cases[k].markdown);
 }
+if (html.length !== cases.length) {
+  throw new Error(`rendered ${html.length} of ${cases.length} cases`);
+}
 
+// The output directory exists in the sandbox, but a local run may point
+// MAKEFUN_OUTPUT_DIR at a fresh path.
+mkdirSync(outputDir, { recursive: true });
 writeFileSync(join(outputDir, "html.json"), JSON.stringify(html));
