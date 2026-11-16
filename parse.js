@@ -732,7 +732,9 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
           const cl = lines[i];
           const cm = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(cl);
           if (cm && cm[1][0] === ch && cm[1].length >= fence.length) { closed = true; i++; break; }
-          body.push(stripFenceChars(cl, Math.min(indent, 3)));
+          // Backtick fences strip up to the opener's indent in chars;
+          // tilde fences leave their body lines untouched.
+          body.push(ch === '`' ? stripFenceChars(cl, Math.min(indent, 3)) : cl);
           i++;
         }
         void closed;
@@ -776,16 +778,15 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         while (i < n && !RE_BLANK.test(lines[i])) { body.push(lines[i]); i++; }
       }
       // Terminator-ended blocks keep the newline that ends their last
-      // line when another content line follows immediately; a block that
-      // runs to the end of the input keeps it when the input's last line
-      // is the empty artefact of a trailing newline. Blocks that end at
-      // a real blank line render with no trailing newline at all.
+      // line whenever a following line exists and is not exactly empty
+      // (whitespace-only lines count as content here). Blank-terminated
+      // blocks lose it, except when the block runs to the empty
+      // artefact of a trailing newline at the end of the input.
       const termKind = hb.kind === 'comment' || hb.kind === 'pi' ||
                        hb.kind === 'decl' || hb.kind === 'cdata' ||
                        hb.kind === 'rawtag';
       const atFinalEmpty = i === n - 1 && lines[i] === '';
-      // For this test a line of only tabs counts as content, not blank.
-      const sep = (termKind && i < n && !/^ *$/.test(lines[i])) || atFinalEmpty ? '\n' : '';
+      const sep = (termKind && i < n && lines[i] !== '') || atFinalEmpty ? '\n' : '';
       tokens.push({ type: 'html', text: body.join('\n'), sep });
       continue;
     }
