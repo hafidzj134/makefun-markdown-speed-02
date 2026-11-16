@@ -166,13 +166,18 @@ function normaliseLabel(s) {
   if (parseCaches !== null) {
     const hit = parseCaches.label.get(s);
     if (hit !== undefined) return hit;
-    const out = s.replace(/[ \t\n\r]+/g, ' ').trim().toLowerCase()
-                 .replace(/ß/g, 'ss').replace(/ς/g, 'σ');
-    parseCaches.label.set(s, out);
-    return out;
   }
-  return s.replace(/[ \t\n\r]+/g, ' ').trim().toLowerCase()
-          .replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+  // Fast path: already in normal form (single spaces, trimmed,
+  // lowercase, no special foldings) — the common case for labels.
+  if (!/[ßς\t\n\r]/.test(s) && !s.includes('  ') &&
+      s === s.trim() && s === s.toLowerCase()) {
+    if (parseCaches !== null) parseCaches.label.set(s, s);
+    return s;
+  }
+  const out = s.replace(/[ \t\n\r]+/g, ' ').trim().toLowerCase()
+               .replace(/ß/g, 'ss').replace(/ς/g, 'σ');
+  if (parseCaches !== null) parseCaches.label.set(s, out);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,269 +1724,298 @@ function computeCodeMask(s) {
   return mask;
 }
 
+// Flush the pending literal-text run of an inline scan into its node
+// list. The scan state `st` is a plain object with a fixed shape:
+// { s, ctx, tracker, inLink, suppressEm, defs, codeMask, nodes,
+//   text, i, n }.
+function flushInlineText(st) {
+  if (st.text) { st.nodes.push({ t: 'text', s: st.text }); st.text = ''; }
+}
+
+// The `<` dispatch of the inline scan: `<scheme:...>` autolinks,
+// `<addr>` e-mail links and raw HTML tags. Returns true when input
+// was consumed; false means the caller treats the `<` as literal.
+function inlineAngle(st) {
+  const s = st.s;
+  const i = st.i;
+  let m = execAt(RE_AUTOLINK_Y, s, i);
+  if (m) {
+    flushInlineText(st);
+    const url = m[1];
+    st.nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(url)) + '">' + escapeText(url) + '</a>' });
+    st.i = i + m[0].length;
+    return true;
+  }
+  m = execAt(RE_EMAIL_LINK_Y, s, i);
+  if (m) {
+    flushInlineText(st);
+    const addr = m[1];
+    st.nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(addr) + '">' + escapeText(addr) + '</a>' });
+    st.i = i + m[0].length;
+    return true;
+  }
+  m = execAt(RE_TAG_Y, s, i);
+  if (m) {
+    flushInlineText(st);
+    st.nodes.push({ t: 'html', s: m[0] });
+    // A raw <a> tag switches the rest of the document's inline
+    // stream into "inside a link" mode (extended autolinks and
+    // bare emails stop linking) until a </a> tag appears.
+    if (/^<a\s/i.test(m[0])) st.ctx.inLink = true;
+    else if (/^<\/a\s*>/.test(m[0])) st.ctx.inLink = false;
+    st.i = i + m[0].length;
+    return true;
+  }
+  return false;
+}
+
+// The bracket dispatch of the inline scan: inline links, full /
+// collapsed / shortcut references and images, plus the failed-link
+// suppression regions. Returns true when input was consumed; false
+// means the caller treats the bracket (or the `!`) as a literal.
+function inlineLink(st) {
+  const s = st.s;
+  const defs = st.defs;
+  const i = st.i;
+  const isImage = s[i] === '!';
+  const openPos = isImage ? i + 1 : i;
+  const close = findClosingBracket(s, openPos + 1, true);
+  if (close !== -1) {
+    const linkText = s.slice(openPos + 1, close);
+    let href = null;
+    let title = null;
+    let end = -1;
+    const after = close + 1;
+    if (s[after] === '(') {
+      const d = parseInlineDest(s, after);
+      if (d) { href = d.href; title = d.title; end = d.end; }
+    }
+    if (end === -1 && s[after] === '[') {
+      const close2 = findClosingBracket(s, after + 1, true);
+      if (close2 !== -1) {
+        const rawLabel = s.slice(after + 1, close2);
+        const label = rawLabel === '' ? linkText : rawLabel;
+        const def = defs.size === 0 ? undefined : defs.get(normaliseLabel(label));
+        if (def) { href = def.href; title = def.title; end = close2 + 1; }
+      }
+    }
+    if (end === -1 && s[after] !== '[') {
+      // Shortcut reference (also the fallback when an inline
+      // destination fails to parse).
+      const def = defs.size === 0 ? undefined : defs.get(normaliseLabel(linkText));
+      if (def) { href = def.href; title = def.title; end = after; }
+    }
+    if (end === -1 && !st.suppressEm) {
+      // A bracketed span followed by a parenthesised destination
+      // that fails to parse: the whole region renders literally,
+      // with emphasis suppressed inside it. The bracket scan for
+      // the region is the permissive one (a backtick-bearing code
+      // span in the text defeats the link but not the region).
+      const rclose = close !== -1 ? close : findClosingBracket(s, openPos + 1, false);
+      if (rclose !== -1 && s[rclose + 1] === '(') {
+        const regionEnd = scanParenRegion(s, rclose + 1);
+        if (regionEnd !== -1) {
+          flushInlineText(st);
+          const html = parseInline(s.slice(i, regionEnd), st.ctx, st.tracker, st.inLink, true);
+          st.nodes.push({ t: 'html', s: html });
+          st.i = regionEnd;
+          return true;
+        }
+      }
+    }
+    if (end !== -1) {
+      if (isImage) {
+        flushInlineText(st);
+        const alt = plainText(linkText, st.ctx);
+        let tag = '<img src="' + escapeAttr(cleanHref(href)) + '" alt="' + escapeAttr(alt) + '"';
+        if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
+        tag += '>';
+        st.nodes.push({ t: 'html', s: tag });
+        st.i = end;
+        return true;
+      }
+      const innerTracker = { link: false };
+      const inner = parseInline(linkText, st.ctx, innerTracker, true);
+      if (!innerTracker.link) {
+        flushInlineText(st);
+        let tag = '<a href="' + escapeAttr(cleanHref(href)) + '"';
+        if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
+        tag += '>' + inner + '</a>';
+        st.nodes.push({ t: 'html', s: tag });
+        if (st.tracker) st.tracker.link = true;
+        st.i = end;
+        return true;
+      }
+      // An inner link won: the outer brackets stay literal.
+    }
+  }
+  if (close === -1) {
+    // The strict scan rejected the label (an unclosed backtick
+    // run, or a backtick-bearing span not at the end). A shortcut
+    // reference may still use the bracketed text: its label scan
+    // is the permissive one. This never applies when an inline
+    // destination or a second label follows the bracket.
+    const pclose = findClosingBracket(s, openPos + 1, false);
+    if (pclose !== -1 && s[pclose + 1] !== '(' && s[pclose + 1] !== '[') {
+      const pText = s.slice(openPos + 1, pclose);
+      const def = defs.size === 0 ? undefined : defs.get(normaliseLabel(pText));
+      if (def) {
+        if (isImage) {
+          flushInlineText(st);
+          const alt = plainText(pText, st.ctx);
+          let tag = '<img src="' + escapeAttr(cleanHref(def.href)) + '" alt="' + escapeAttr(alt) + '"';
+          if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
+          tag += '>';
+          st.nodes.push({ t: 'html', s: tag });
+          st.i = pclose + 1;
+          return true;
+        }
+        const innerTracker = { link: false };
+        const inner = parseInline(pText, st.ctx, innerTracker, true);
+        if (!innerTracker.link) {
+          flushInlineText(st);
+          let tag = '<a href="' + escapeAttr(cleanHref(def.href)) + '"';
+          if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
+          tag += '>' + inner + '</a>';
+          st.nodes.push({ t: 'html', s: tag });
+          if (st.tracker) st.tracker.link = true;
+          st.i = pclose + 1;
+          return true;
+        }
+      }
+    }
+  }
+  if (close === -1 && !st.suppressEm) {
+    // The strict bracket scan found no link (for example a
+    // backtick-bearing code span in the text), but a failed-link
+    // region may still start here.
+    const rclose = findClosingBracket(s, openPos + 1, false);
+    if (rclose !== -1 && s[rclose + 1] === '(') {
+      const regionEnd = scanParenRegion(s, rclose + 1);
+      if (regionEnd !== -1) {
+        flushInlineText(st);
+        const html = parseInline(s.slice(i, regionEnd), st.ctx, st.tracker, st.inLink, true);
+        st.nodes.push({ t: 'html', s: html });
+        st.i = regionEnd;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function parseInline(s, ctx, tracker, inLink, suppressEm) {
-  const defs = ctx.defs;
-  const codeMask = suppressEm || !s.includes('`') ? null : computeCodeMask(s);
-  const nodes = [];
-  let text = '';
-  const flushText = () => {
-    if (text) { nodes.push({ t: 'text', s: text }); text = ''; }
+  const st = {
+    s, ctx, tracker, inLink, suppressEm,
+    defs: ctx.defs,
+    codeMask: suppressEm || !s.includes('`') ? null : computeCodeMask(s),
+    nodes: [], text: '', i: 0, n: s.length,
   };
-  let i = 0;
-  const n = s.length;
-  while (i < n) {
-    const ch = s[i];
+  const nodes = st.nodes;
+  while (st.i < st.n) {
+    const ch = s[st.i];
     if (ch === '\\') {
-      const nx = s[i + 1];
+      const nx = s[st.i + 1];
       if (nx === '\n') {
-        flushText();
+        flushInlineText(st);
         nodes.push({ t: 'break' });
-        i += 2;
-        while (s[i] === ' ' || s[i] === '\t') i++;
+        st.i += 2;
+        while (s[st.i] === ' ' || s[st.i] === '\t') st.i++;
         continue;
       }
       if (nx !== undefined && isAsciiPunct(nx)) {
         // An escaped character is literal: it must not be reinterpreted
         // (e.g. \& must not become an entity reference start).
-        flushText();
+        flushInlineText(st);
         nodes.push({ t: 'esc', ch: nx });
-        i += 2;
+        st.i += 2;
         continue;
       }
-      text += ch; i++; continue;
+      st.text += ch; st.i++; continue;
     }
     if (ch === '\n') {
       // Hard break when the line ends with two or more spaces.
-      if (/ {2,}$/.test(text)) {
-        text = text.replace(/ +$/, '');
-        flushText();
+      if (/ {2,}$/.test(st.text)) {
+        st.text = st.text.replace(/ +$/, '');
+        flushInlineText(st);
         nodes.push({ t: 'break' });
-        i++;
-        while (s[i] === ' ' || s[i] === '\t') i++;
+        st.i++;
+        while (s[st.i] === ' ' || s[st.i] === '\t') st.i++;
         continue;
       }
-      text += ch; i++; continue;
+      st.text += ch; st.i++; continue;
     }
     if (ch === '`') {
       let run = 0;
-      while (s[i] === '`') { run++; i++; }
+      while (s[st.i] === '`') { run++; st.i++; }
       // Find a closing run of exactly the same length.
-      let j = i;
+      let j = st.i;
       let found = -1;
       let foundEnd = -1;
-      while (j < n) {
+      while (j < st.n) {
         if (s[j] === '`') {
           let m = 0;
-          const st = j;
+          const rs = j;
           while (s[j] === '`') { m++; j++; }
-          if (m === run) { found = st; foundEnd = j; break; }
+          if (m === run) { found = rs; foundEnd = j; break; }
         } else j++;
       }
       if (found === -1) {
-        text += '`'.repeat(run);
+        st.text += '`'.repeat(run);
         continue;
       }
-      let content = s.slice(i, found).replace(/\n/g, ' ');
+      let content = s.slice(st.i, found).replace(/\n/g, ' ');
       if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' &&
           /[^ ]/.test(content)) {
         content = content.slice(1, -1);
       }
-      flushText();
+      flushInlineText(st);
       nodes.push({ t: 'html', s: '<code>' + escapeCode(content) + '</code>' });
-      i = foundEnd;
+      st.i = foundEnd;
       continue;
     }
     if (ch === '<') {
-      let m = execAt(RE_AUTOLINK_Y, s, i);
-      if (m) {
-        flushText();
-        const url = m[1];
-        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(url)) + '">' + escapeText(url) + '</a>' });
-        i += m[0].length;
-        continue;
-      }
-      m = execAt(RE_EMAIL_LINK_Y, s, i);
-      if (m) {
-        flushText();
-        const addr = m[1];
-        nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(addr) + '">' + escapeText(addr) + '</a>' });
-        i += m[0].length;
-        continue;
-      }
-      m = execAt(RE_TAG_Y, s, i);
-      if (m) {
-        flushText();
-        nodes.push({ t: 'html', s: m[0] });
-        // A raw <a> tag switches the rest of the document's inline
-        // stream into "inside a link" mode (extended autolinks and
-        // bare emails stop linking) until a </a> tag appears.
-        if (/^<a\s/i.test(m[0])) ctx.inLink = true;
-        else if (/^<\/a\s*>/.test(m[0])) ctx.inLink = false;
-        i += m[0].length;
-        continue;
-      }
-      text += ch; i++; continue;
+      if (inlineAngle(st)) continue;
+      st.text += ch; st.i++; continue;
     }
-    if (ch === '[' || (ch === '!' && s[i + 1] === '[')) {
-      const isImage = ch === '!';
-      const openPos = isImage ? i + 1 : i;
-      const close = findClosingBracket(s, openPos + 1, true);
-      if (close !== -1) {
-        const linkText = s.slice(openPos + 1, close);
-        let href = null;
-        let title = null;
-        let end = -1;
-        const after = close + 1;
-        if (s[after] === '(') {
-          const d = parseInlineDest(s, after);
-          if (d) { href = d.href; title = d.title; end = d.end; }
-        }
-        if (end === -1 && s[after] === '[') {
-          const close2 = findClosingBracket(s, after + 1, true);
-          if (close2 !== -1) {
-            const rawLabel = s.slice(after + 1, close2);
-            const label = rawLabel === '' ? linkText : rawLabel;
-            const def = defs.get(normaliseLabel(label));
-            if (def) { href = def.href; title = def.title; end = close2 + 1; }
-          }
-        }
-        if (end === -1 && s[after] !== '[') {
-          // Shortcut reference (also the fallback when an inline
-          // destination fails to parse).
-          const def = defs.get(normaliseLabel(linkText));
-          if (def) { href = def.href; title = def.title; end = after; }
-        }
-        if (end === -1 && !suppressEm) {
-          // A bracketed span followed by a parenthesised destination
-          // that fails to parse: the whole region renders literally,
-          // with emphasis suppressed inside it. The bracket scan for
-          // the region is the permissive one (a backtick-bearing code
-          // span in the text defeats the link but not the region).
-          const rclose = close !== -1 ? close : findClosingBracket(s, openPos + 1, false);
-          if (rclose !== -1 && s[rclose + 1] === '(') {
-            const regionEnd = scanParenRegion(s, rclose + 1);
-            if (regionEnd !== -1) {
-              flushText();
-              const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
-              nodes.push({ t: 'html', s: html });
-              i = regionEnd;
-              continue;
-            }
-          }
-        }
-        if (end !== -1) {
-          if (isImage) {
-            flushText();
-            const alt = plainText(linkText, ctx);
-            let tag = '<img src="' + escapeAttr(cleanHref(href)) + '" alt="' + escapeAttr(alt) + '"';
-            if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
-            tag += '>';
-            nodes.push({ t: 'html', s: tag });
-            i = end;
-            continue;
-          }
-          const innerTracker = { link: false };
-          const inner = parseInline(linkText, ctx, innerTracker, true);
-          if (!innerTracker.link) {
-            flushText();
-            let tag = '<a href="' + escapeAttr(cleanHref(href)) + '"';
-            if (title !== null) tag += ' title="' + escapeAttr(title) + '"';
-            tag += '>' + inner + '</a>';
-            nodes.push({ t: 'html', s: tag });
-            if (tracker) tracker.link = true;
-            i = end;
-            continue;
-          }
-          // An inner link won: the outer brackets stay literal.
-        }
-      }
-      if (close === -1) {
-        // The strict scan rejected the label (an unclosed backtick
-        // run, or a backtick-bearing span not at the end). A shortcut
-        // reference may still use the bracketed text: its label scan
-        // is the permissive one. This never applies when an inline
-        // destination or a second label follows the bracket.
-        const pclose = findClosingBracket(s, openPos + 1, false);
-        if (pclose !== -1 && s[pclose + 1] !== '(' && s[pclose + 1] !== '[') {
-          const pText = s.slice(openPos + 1, pclose);
-          const def = defs.get(normaliseLabel(pText));
-          if (def) {
-            if (isImage) {
-              flushText();
-              const alt = plainText(pText, ctx);
-              let tag = '<img src="' + escapeAttr(cleanHref(def.href)) + '" alt="' + escapeAttr(alt) + '"';
-              if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
-              tag += '>';
-              nodes.push({ t: 'html', s: tag });
-              i = pclose + 1;
-              continue;
-            }
-            const innerTracker = { link: false };
-            const inner = parseInline(pText, ctx, innerTracker, true);
-            if (!innerTracker.link) {
-              flushText();
-              let tag = '<a href="' + escapeAttr(cleanHref(def.href)) + '"';
-              if (def.title !== null) tag += ' title="' + escapeAttr(def.title) + '"';
-              tag += '>' + inner + '</a>';
-              nodes.push({ t: 'html', s: tag });
-              if (tracker) tracker.link = true;
-              i = pclose + 1;
-              continue;
-            }
-          }
-        }
-      }
-      if (close === -1 && !suppressEm) {
-        // The strict bracket scan found no link (for example a
-        // backtick-bearing code span in the text), but a failed-link
-        // region may still start here.
-        const rclose = findClosingBracket(s, openPos + 1, false);
-        if (rclose !== -1 && s[rclose + 1] === '(') {
-          const regionEnd = scanParenRegion(s, rclose + 1);
-          if (regionEnd !== -1) {
-            flushText();
-            const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
-            nodes.push({ t: 'html', s: html });
-            i = regionEnd;
-            continue;
-          }
-        }
-      }
-      text += ch; i++; continue;
+    if (ch === '[' || (ch === '!' && s[st.i + 1] === '[')) {
+      if (inlineLink(st)) continue;
+      st.text += ch; st.i++; continue;
     }
     if (ch === '*' || ch === '_' || ch === '~') {
-      const runStart = i;
+      const runStart = st.i;
       let run = 0;
-      while (s[i] === ch) { run++; i++; }
-      if (suppressEm || (codeMask !== null && codeMask[runStart] === 1)) {
+      while (s[st.i] === ch) { run++; st.i++; }
+      if (st.suppressEm || (st.codeMask !== null && st.codeMask[runStart] === 1)) {
         // Inside a globally paired code span (see computeCodeMask)
         // the delimiter does not exist for emphasis.
-        text += ch.repeat(run); continue;
+        st.text += ch.repeat(run); continue;
       }
-      flushText();
-      nodes.push({ t: 'delim', ch, len: run, origLen: run, s: s.slice(i - run, i) });
+      flushInlineText(st);
+      nodes.push({ t: 'delim', ch, len: run, origLen: run, s: s.slice(st.i - run, st.i) });
       continue;
     }
     // Extended autolinks starting inside running text.
+    const i = st.i;
     const chLow = (ch >= 'A' && ch <= 'Z') ? ch.toLowerCase() : ch;
-    if (!inLink && !ctx.inLink &&
+    if (!st.inLink && !st.ctx.inLink &&
         (chLow === 'w' || chLow === 'h' || chLow === 'f' || chLow === 'm' || chLow === 'x') &&
         (i === 0 || !/[A-Za-z0-9]/.test(s[i - 1]))) {
       const auto = matchExtendedAutolink(s, i);
       if (auto) {
-        flushText();
+        flushInlineText(st);
         nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(auto.href)) + '">' + escapeText(auto.text) + '</a>',
                      fc: auto.text[0], lc: auto.text[auto.text.length - 1] });
-        i = auto.end;
+        st.i = auto.end;
         continue;
       }
     }
-    if (!inLink && !ctx.inLink &&
+    if (!st.inLink && !st.ctx.inLink &&
         (ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') &&
         (i === 0 || !/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i - 1]))) {
       const em = matchEmailCore(s, i);
       if (em) {
-        flushText();
+        flushInlineText(st);
         if (em.cand) {
           // Followed by an underscore run: only a link when that run
           // turns out to close an emphasis span around this address
@@ -1991,14 +2025,14 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           nodes.push({ t: 'html', s: '<a href="mailto:' + escapeAttr(em.addr) + '">' + escapeText(em.addr) + '</a>',
                        fc: em.addr[0], lc: em.addr[em.addr.length - 1] });
         }
-        i += em.addr.length;
+        st.i += em.addr.length;
         continue;
       }
     }
-    text += ch;
-    i++;
+    st.text += ch;
+    st.i++;
   }
-  flushText();
+  flushInlineText(st);
   processEmphasis(nodes, s);
   resolveEmailCands(nodes, false);
   return renderNodes(nodes);

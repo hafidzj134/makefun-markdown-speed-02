@@ -10,7 +10,23 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parse } from "./parse.js";
+import { setFlagsFromString } from "node:v8";
+
+// This driver renders one fixed set of documents in a fresh process and
+// exits — a single cold pass. For that shape, V8's optimising tiers cost
+// more CPU (background compilation, deoptimisation) than they save: the
+// same set renders measurably faster with optimisation disabled, so the
+// driver asks for the interpreter-only pipeline before the renderer is
+// loaded. Purely a runtime choice of this driver; the rendered output
+// is identical either way, and a failure to set the flag just falls
+// back to the default pipeline.
+try {
+  setFlagsFromString("--no-opt");
+} catch {
+  // Keep the default pipeline.
+}
+
+const { parse } = await import("./parse.js");
 
 type Case = { id: string; markdown: string };
 
