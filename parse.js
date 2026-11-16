@@ -893,13 +893,13 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         if (i === n - 1 && chunk.length && l.length > 0) { chunk.push(l); i++; }
         break;
       }
-      if (lazySet && lazySet.has(i)) { chunk.push(l); i++; continue; }
       // Inside a list item, a paragraph continuation line that is still
       // indented by four or more columns after the item dedent has
-      // those four columns folded away.
+      // those four columns folded away (lazy lines included).
       if (inItem && measureIndent(l, 0, 4, baseCol).cols >= 4) {
         l = stripIndent(l, 4, false, baseCol) ?? l;
       }
+      if (lazySet && lazySet.has(i)) { chunk.push(l); i++; continue; }
       const sm = RE_SETEXT.exec(l);
       if (sm && chunk.length >= 1) { setext = sm[1][0] === '=' ? 1 : 2; i++; break; }
       // Table: second line is a delimiter row.
@@ -1114,7 +1114,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
           !RE_ATX.test(l) && !isFenceLine(l) && !RE_QUOTE.test(l) &&
           !RE_HR.test(l) && !htmlInterrupts(htmlBlockStart(l))) {
         itemLazy.add(itemLines.length);
-        itemLines.push(stripUpTo(l, contentIndent, baseCol));
+        itemLines.push(l);
         i++;
         continue;
       }
