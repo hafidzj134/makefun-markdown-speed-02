@@ -33,7 +33,29 @@ function isSpace(ch) {
 
 // Escape text-node content: &, <, > — but leave well-formed entity
 // references alone (numeric references are decoded to their character).
-const ENTITY_RE = /&(#\d+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);/g;
+const ENTITY_RE = /&(#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]*);/g;
+
+// The character a numeric character reference stands for, with the
+// usual replacement-character rules.
+function entityChar(body) {
+  let cp;
+  if (body[1] === 'x' || body[1] === 'X') cp = parseInt(body.slice(2), 16);
+  else cp = parseInt(body.slice(1), 10);
+  if (cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+  return String.fromCodePoint(cp);
+}
+
+// Escape a single character for text content.
+function escapeChar(ch) {
+  switch (ch) {
+    case '&': return '&amp;';
+    case '<': return '&lt;';
+    case '>': return '&gt;';
+    case '"': return '&quot;';
+    case "'": return '&#39;';
+    default: return ch;
+  }
+}
 
 function escapeText(s) {
   if (!/[&<>"']/.test(s)) return s;
@@ -51,11 +73,7 @@ function escapeText(s) {
       if (m && m.index === i) {
         const body = m[1];
         if (body[0] === '#') {
-          let cp;
-          if (body[1] === 'x' || body[1] === 'X') cp = parseInt(body.slice(2), 16);
-          else cp = parseInt(body.slice(1), 10);
-          if (cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
-          out += s.slice(last, i) + String.fromCodePoint(cp);
+          out += s.slice(last, i) + escapeChar(entityChar(body));
           i += m[0].length - 1;
           last = i + 1;
         } else {
@@ -122,13 +140,7 @@ function cleanHref(href) {
 function unescapeString(s) {
   if (!/[\\&]/.test(s)) return s;
   s = s.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, '$1');
-  s = s.replace(/&(#\d+|#[xX][0-9a-fA-F]+);/g, (all, body) => {
-    let cp;
-    if (body[1] === 'x' || body[1] === 'X') cp = parseInt(body.slice(2), 16);
-    else cp = parseInt(body.slice(1), 10);
-    if (cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
-    return String.fromCodePoint(cp);
-  });
+  s = s.replace(/&(#\d{1,7}|#[xX][0-9a-fA-F]{1,6});/g, (all, body) => entityChar(body));
   // Named entities in URLs: a small, common table; anything else stays as-is
   // except &amp; which decodes to &.
   s = s.replace(/&amp;/g, '&');
@@ -199,6 +211,12 @@ function stripQuoteMarker(line, baseCol) {
   while (i < line.length && cols < 3 && line[i] === ' ') { i++; cols++; }
   if (line[i] !== '>') return null;
   i++; cols++;
+  if (line[i] === '\t') {
+    // The tab itself is the marker's one optional whitespace: only its
+    // first column is consumed, the rest stays as content spaces.
+    const w = 4 - ((baseCol + cols) % 4);
+    return { text: ' '.repeat(w - 1) + line.slice(i + 1), cols: cols + 1 };
+  }
   if (line[i] === ' ') { i++; cols++; }
   if (line[i] === '\t') {
     return { text: ' '.repeat(4 - ((baseCol + cols) % 4)) + line.slice(i + 1), cols };
@@ -456,6 +474,26 @@ function listMarker(line, baseCol) {
   return { bullet, num, indentCols, markerWidth: markerLen, afterPos, contentPos, contentIndent, ordered: num !== null };
 }
 
+// The text of a list item's first line, expressed in the item's content
+// coordinates (column zero = contentIndent). Whitespace before that
+// column is dropped; a tab straddling it leaves its remaining width as
+// spaces, so later characters keep their true absolute columns.
+function itemFirstContent(line, lm, baseCol) {
+  const target = lm.contentIndent;
+  let cols = lm.indentCols + lm.markerWidth;
+  let out = '';
+  let i = lm.afterPos;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch !== ' ' && ch !== '\t') break;
+    const w = ch === ' ' ? 1 : 4 - ((baseCol + cols) % 4);
+    if (cols + w > target) out += ' '.repeat(cols + w - target);
+    cols += w;
+    i++;
+  }
+  return out + line.slice(i);
+}
+
 // Strip `indent` columns from the start of a line; returns the remaining
 // text, or null when the line has fewer columns of indentation (and is not
 // blank). Partially-consumed tabs leave spaces behind.
@@ -605,7 +643,7 @@ function lexBlocks(lines, state, inItem, baseCol, meter, lazySet) {
         }
         void closed;
         if (body.length && body[body.length - 1] === '') body.pop();
-        tokens.push({ type: 'code', text: body.length ? body.join('\n') + '\n' : '', lang: info.split(/[ \t]/)[0] || '' });
+        tokens.push({ type: 'code', text: body.length ? body.join('\n') + '\n' : '', lang: info.replace(/\\([!"#$%&'()*+,\-.\/:;<=>?@\[\\\]^_`{|}~])/g, '$1').split(/[ \t]/)[0] || '' });
         continue;
       }
     }
@@ -857,7 +895,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
     // First line content: the text after the marker and its whitespace.
     const firstLine = lines[i];
     const contentIndent = lm.contentIndent;
-    const itemLines = [firstLine.slice(lm.contentPos)];
+    const itemLines = [itemFirstContent(firstLine, lm, baseCol)];
     i++;
     let itemSawBlank = false;
     let pendingBlanks = 0;
@@ -869,6 +907,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
         let j = i;
         while (j < lines.length && RE_BLANK.test(lines[j])) j++;
         if (j >= lines.length) { i = j; lastWasBlankRun = true; break; }
+        if (RE_HR.test(lines[j])) { i = j; lastWasBlankRun = true; break; }
         const nextLm = listMarker(lines[j], baseCol);
         const stripped = stripIndent(lines[j], contentIndent, true, baseCol);
         if (nextLm && nextLm.ordered === ordered &&
@@ -926,6 +965,7 @@ function lexList(lines, start, firstLm, state, baseCol) {
       if (meter.blankBetween) loose = true;
     // Continue with the next item if the next line is a matching marker.
     if (i >= lines.length) break;
+    if (RE_HR.test(lines[i])) break;
     const nlm = listMarker(lines[i], baseCol);
     if (!nlm || nlm.ordered !== ordered) break;
     if (!ordered && nlm.bullet !== bulletChar) break;
@@ -1184,7 +1224,14 @@ function parseInline(s, defs, tracker) {
     if (ch === '\\') {
       const nx = s[i + 1];
       if (nx === '\n') { flushText(); nodes.push({ t: 'break' }); i += 2; continue; }
-      if (nx !== undefined && isPunct(nx)) { text += nx; i += 2; continue; }
+      if (nx !== undefined && isPunct(nx)) {
+        // An escaped character is literal: it must not be reinterpreted
+        // (e.g. \& must not become an entity reference start).
+        flushText();
+        nodes.push({ t: 'esc', ch: nx });
+        i += 2;
+        continue;
+      }
       text += ch; i++; continue;
     }
     if (ch === '\n') {
@@ -1233,7 +1280,7 @@ function parseInline(s, defs, tracker) {
       if (m) {
         flushText();
         const url = m[1];
-        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(unescapeString(url))) + '">' + escapeText(url) + '</a>' });
+        nodes.push({ t: 'html', s: '<a href="' + escapeAttr(cleanHref(url)) + '">' + escapeText(url) + '</a>' });
         i += m[0].length;
         continue;
       }
@@ -1460,6 +1507,7 @@ function renderNodes(nodes) {
   let out = '';
   for (const nd of nodes) {
     if (nd.t === 'text') out += escapeText(nd.s);
+    else if (nd.t === 'esc') out += escapeChar(nd.ch);
     else if (nd.t === 'html') out += nd.s;
     else if (nd.t === 'break') out += '<br>';
     else if (nd.t === 'delim') out += nd.ch.repeat(nd.len);
