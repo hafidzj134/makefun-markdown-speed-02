@@ -1160,7 +1160,7 @@ const RE_TAG = new RegExp(
 
 // Find the index of the ']' that closes a bracket opened just before pos,
 // honouring escapes, code spans and nested brackets. Returns -1 if none.
-function findClosingBracket(s, pos) {
+function findClosingBracket(s, pos, forRegion) {
   let depth = 1;
   let i = pos;
   while (i < s.length) {
@@ -1169,7 +1169,9 @@ function findClosingBracket(s, pos) {
     if (ch === '`') {
       // Skip a code span. An unmatched run is literal text and does
       // not hide the closing bracket. A complete span whose content
-      // itself contains a backtick defeats the link entirely.
+      // itself contains a backtick defeats the link entirely (but not
+      // the wider scan for a failed-link region, which only needs the
+      // bracket structure).
       let n = 0;
       while (s[i] === '`') { n++; i++; }
       let j = i;
@@ -1186,7 +1188,7 @@ function findClosingBracket(s, pos) {
       if (closedSpan) {
         // A span whose content contains a backtick is only tolerated
         // when it sits at the very end of the link text.
-        if (s.slice(i, closeStart).includes('`') && s[j] !== ']') return -1;
+        if (!forRegion && s.slice(i, closeStart).includes('`') && s[j] !== ']') return -1;
         i = j;
       }
       continue;
@@ -1547,17 +1549,22 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
           const def = defs.get(normaliseLabel(linkText));
           if (def) { href = def.href; title = def.title; end = after; }
         }
-        if (end === -1 && s[after] === '(' && !suppressEm) {
+        if (end === -1 && !suppressEm) {
           // A bracketed span followed by a parenthesised destination
           // that fails to parse: the whole region renders literally,
-          // with emphasis suppressed inside it.
-          const regionEnd = scanParenRegion(s, after);
-          if (regionEnd !== -1) {
-            flushText();
-            const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
-            nodes.push({ t: 'html', s: html });
-            i = regionEnd;
-            continue;
+          // with emphasis suppressed inside it. The bracket scan for
+          // the region is the permissive one (a backtick-bearing code
+          // span in the text defeats the link but not the region).
+          const rclose = close !== -1 ? close : findClosingBracket(s, openPos + 1, true);
+          if (rclose !== -1 && s[rclose + 1] === '(') {
+            const regionEnd = scanParenRegion(s, rclose + 1);
+            if (regionEnd !== -1) {
+              flushText();
+              const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
+              nodes.push({ t: 'html', s: html });
+              i = regionEnd;
+              continue;
+            }
           }
         }
         if (end !== -1) {
@@ -1584,6 +1591,22 @@ function parseInline(s, ctx, tracker, inLink, suppressEm) {
             continue;
           }
           // An inner link won: the outer brackets stay literal.
+        }
+      }
+      if (close === -1 && !suppressEm) {
+        // The strict bracket scan found no link (for example a
+        // backtick-bearing code span in the text), but a failed-link
+        // region may still start here.
+        const rclose = findClosingBracket(s, openPos + 1, true);
+        if (rclose !== -1 && s[rclose + 1] === '(') {
+          const regionEnd = scanParenRegion(s, rclose + 1);
+          if (regionEnd !== -1) {
+            flushText();
+            const html = parseInline(s.slice(i, regionEnd), ctx, tracker, inLink, true);
+            nodes.push({ t: 'html', s: html });
+            i = regionEnd;
+            continue;
+          }
         }
       }
       text += ch; i++; continue;
@@ -1721,8 +1744,9 @@ function poisonState(nodes, oi, ci, tag, ch, closerLen, use) {
     const ai = nextIdx(k + 1);
     if (ai === -1) continue; // the nested span ends the content: clean
     const A = nodes[ai];
+    if (A.t === 'delim' && A.ch === '~') return 'poison';
     if (A.t !== 'text') continue;
-    if (/^\s/.test(A.s)) continue; // cleanly separated from what follows
+    if (!/^[\p{L}\p{N}]/u.test(A.s)) continue; // attachment starts with a word character
     const bi = nextIdx(ai + 1);
     if (bi === -1) {
       // The attached text runs right up to the closing run: the
